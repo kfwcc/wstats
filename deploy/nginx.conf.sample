@@ -1,0 +1,113 @@
+# WebStats 生产环境 Nginx 配置样例（宝塔 / 通用）
+#
+# 发布包 v1.0.1+ 为**统一布局**，包根 = 站点目录，`public/` 是唯一的 Web 运行目录：
+#
+#   <包根>/              例：/www/wwwroot/webstats
+#     app/               后端代码（含 app/bootstrap.php）
+#     config.php         出厂默认配置
+#     data/              运行期数据（installed.php / install.lock / ip2region.xdb + ip2region_v6.xdb / verify/ / backup/）
+#     public/            ★ Web 根目录（运行目录）
+#       index.php        入口：管理端 API + 未安装引导 + SPA 回退
+#       collect.php      采集端点
+#       index.html assets/ geo/ sdk/    前端产物与对外 SDK
+#       install/         安装向导（安装完成后请删除）
+#     scripts/           worker.php / cron.php / doctor.php
+#     sql/ sdk/ deploy/ docs/
+#
+# 关键点：
+#   1) root 必须指向 **<包根>/public**（宝塔面板里即：网站目录=包根，运行目录=/public）；
+#   2) app/ data/ scripts/ sql/ 都在 Web 根之外 → 天然不可直访，无需额外屏蔽规则；
+#   3) index.php 同时负责「管理端 API」与「未安装引导 / SPA 回退」，
+#      所以 location / 要交给 index.php，未安装时会由服务端 302 到 /install/；
+#   4) 安装完成后建议拒绝访问 /install/（或直接删除 public/install 目录）。
+
+server {
+    listen 80;
+    server_name stats.example.com;                # 改成你的域名
+
+    root /www/wwwroot/webstats/public;            # ← 包根下的 public
+    index index.php index.html;
+
+    # ---------- 管理端 SPA + 未安装引导 ----------
+    # 交给 index.php：未安装 → 302 /install/；已安装 → 输出 index.html
+    location / {
+        try_files $uri $uri/ /index.php$is_args$args;
+    }
+
+    # ---------- 管理端 API（含 /api/health 健康检查） ----------
+    location ^~ /api/ {
+        try_files $uri /index.php$is_args$args;
+    }
+
+    # ---------- 采集端点 ----------
+    # 【重要】采集端点是 POST 请求，必须由 PHP-FPM 执行，这里**不要**再写「精确匹配 + try_files」的静态块：
+    #     ✗ location = /collect.php { try_files $uri =404; }
+    #   `location =` 是精确匹配，优先级高于正则 location，会把 /collect.php 从 location ~ \.php$ 手里
+    #   抢走；块内没有 fastcgi 处理器 → nginx 按静态文件返回 → POST 得到
+    #   「405 Method Not Allowed」（GET 则变成下载 PHP 源码）。
+    # 正确做法：什么都不写，交给下面的 location ~ \.php$ 处理。
+    # 若确实想显式声明，必须自带 FastCGI（不能只写 try_files）：
+    #     location = /collect.php {
+    #         fastcgi_pass unix:/tmp/php-cgi-82.sock;   # 或 127.0.0.1:9000
+    #         include fastcgi_params;
+    #         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    #     }
+    #
+    # 可选：短链形式 /c/{siteKey}（rewrite 到 .php 后会重新匹配 location，安全）
+    location ^~ /c/ {
+        rewrite ^/c/(.*)$ /collect.php?ak=$1 last;
+    }
+
+    # ---------- 安装向导（Web 根内的 public/install） ----------
+    # 安装完成后强烈建议改为拒绝访问：
+    # location ^~ /install/ { deny all; return 404; }
+    #
+    # 提示：目录结构较特殊（例如包根挂在站点目录之外）时，可在 PHP-FPM 池配置里指定：
+    #   env[WSTAT_ROOT] = /www/wwwroot/webstats
+    # 或在安装器目录写 public/install/local.php（安装向导第一步提供「手动指路」表单自动生成）。
+
+    # ---------- SDK 静态资源 ----------
+    location ^~ /sdk/ {
+        try_files $uri =404;
+        expires 7d;
+        add_header Cache-Control "public";
+    }
+
+    # ---------- PHP ----------
+    location ~ \.php$ {
+        # 宝塔：include enable-php-82.conf;
+        fastcgi_pass 127.0.0.1:9000;              # 或 unix:/tmp/php-cgi-82.sock
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_read_timeout 60s;
+    }
+
+    # ---------- 实时数据不可缓存（面板「数据不更新」的头号原因） ----------
+    # 应用已自带 Cache-Control: no-store，但 CDN / proxy_cache 会无视它，
+    # 若站点前置了缓存，务必把 /api/ 与 /collect.php 排除在缓存之外。
+
+    # ---------- 旧版布局兼容（仅当从 ≤1.0.0 的包原地升级时可能用到） ----------
+    # 旧包把后端放在 Web 根内的 server/ 目录，需屏蔽直访；统一布局下不需要：
+    # location ^~ /server/ { deny all; return 404; }
+
+    client_max_body_size 1m;
+    access_log /www/wwwlogs/webstats.log;
+    error_log  /www/wwwlogs/webstats.error.log;
+}
+
+# ---------------------------------------------------------------------------
+# 宝塔面板「防跨站攻击(open_basedir)」说明
+# ---------------------------------------------------------------------------
+# 宝塔默认把 open_basedir 限制为「网站目录:/tmp」，**运行目录不影响该限制**。
+# 统一布局下请这样设置（两步）：
+#   面板 → 网站 → 设置 → 网站目录：
+#     网站目录 = <包根>（例如 /www/wwwroot/webstats）   ← open_basedir 覆盖到它
+#     运行目录 = /public                                ← 站点实际 root 指向它
+# 这样 app/ data/ scripts/ 都在 open_basedir 允许范围内，安装器的自动探测与写入都能正常工作。
+#
+# 若目录结构特殊（例如包根在站点目录之外），二选一：
+#   A. 把「网站目录」设为包根、「运行目录」设为 /public（推荐）；
+#   B. 在 public/install/ 目录写入 local.php（安装向导第一步可一键生成「手动指路」表单）：
+#        <?php return ['root' => '/www/wwwroot/webstats'];
+#   C. 或直接给站点关闭「防跨站攻击」(不推荐)。

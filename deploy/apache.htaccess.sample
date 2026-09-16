@@ -1,0 +1,47 @@
+# WebStats Apache 配置样例
+# 放置位置：发布包统一布局的 **public/.htaccess**（需开启 mod_rewrite）
+#
+# 宝塔 Apache 用户：站点根目录指向 <包根>/public（宝塔：网站目录=包根、运行目录=/public），
+# 并在站点配置中允许 .htaccess（AllowOverride All）。
+# 后端 app/ 、data/ 、scripts/ 都在 public 之外，因此无需在 .htaccess 里额外屏蔽它们。
+
+# 目录索引必须包含 index.php：/install/ 才能直接打开安装向导
+DirectoryIndex index.php index.html
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /
+
+    # 已存在的文件/目录直接返回（静态资源、SDK 等）
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+
+    # 采集端点
+    RewriteRule ^collect(\.php)?$ collect.php [L,QSA]
+
+    # 管理端 API
+    RewriteRule ^api/ index.php [L,QSA]
+
+    # 其余路径交给 index.php：
+    #   未安装 → 服务端 302 跳转 /install/（自动引导安装）
+    #   已安装 → 输出前端产物 index.html（SPA 回退）
+    RewriteRule ^ index.php [L]
+</IfModule>
+
+# 安全：后端目录与运行期数据目录禁止直访（项目被放进 Web 根时尤其重要）
+<IfModule mod_authz_core.c>
+    <FilesMatch "^(installed\.php|install\.lock|.*\.log)$">
+        Require all denied
+    </FilesMatch>
+</IfModule>
+
+# 静态资源缓存
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresByType application/javascript "access plus 7 days"
+    ExpiresByType text/css "access plus 7 days"
+</IfModule>
+
+# 默认字符集
+AddDefaultCharset UTF-8
