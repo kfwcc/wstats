@@ -14,4 +14,4 @@
  */
 declare(strict_types=1);
 
-return '1.0.10';
+return '1.0.11';

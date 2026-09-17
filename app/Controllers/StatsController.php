@@ -13,6 +13,7 @@ use Wstat\Support\Auth;
 use Wstat\Support\Db;
 use Wstat\Support\IpLocator;
 use Wstat\Support\Rds;
+use Wstat\Support\Referrer;
 use Wstat\Support\Sessionizer;
 use Wstat\Support\Settings;
 use Wstat\Support\SiteAccess;
@@ -446,16 +447,16 @@ class StatsController
         // 预检：来源分析查询依赖归因扩展列；库未跑增量迁移时给出明确提示而非 SQLSTATE 500
         $missing = [];
         $cols = Db::tableColumns('events');
-        foreach (['utm_source', 'utm_medium', 'click_source', 'ref_host'] as $need) {
+        foreach (['utm_source', 'utm_medium', 'click_source', 'ref_host', 'kw'] as $need) {
             if (!isset($cols[$need])) {
                 $missing[] = $need;
             }
         }
         if ($missing) {
-            $alter = "ALTER TABLE `events`\n  ADD COLUMN `utm_source`   VARCHAR(128) NOT NULL DEFAULT '' AFTER `medium`,\n  ADD COLUMN `utm_medium`   VARCHAR(128) NOT NULL DEFAULT '' AFTER `utm_source`,\n  ADD COLUMN `click_source` VARCHAR(64)  NOT NULL DEFAULT '' AFTER `click_id`,\n  ADD COLUMN `ref_host`     VARCHAR(255) NOT NULL DEFAULT '' AFTER `click_source`;";
+            $alter = "ALTER TABLE `events`\n  ADD COLUMN `utm_source`   VARCHAR(128) NOT NULL DEFAULT '' AFTER `medium`,\n  ADD COLUMN `utm_medium`   VARCHAR(128) NOT NULL DEFAULT '' AFTER `utm_source`,\n  ADD COLUMN `click_source` VARCHAR(64)  NOT NULL DEFAULT '' AFTER `click_id`,\n  ADD COLUMN `ref_host`     VARCHAR(255) NOT NULL DEFAULT '' AFTER `click_source`,\n  ADD COLUMN `kw`           VARCHAR(255) NOT NULL DEFAULT '' AFTER `ref_host`;";
             wstat_err(
                 'events 表缺少来源分析列：' . implode(', ', $missing) . "。请在数据库执行升级：\n\n" . $alter
-                . "\n\n或直接运行：mysql -uroot -p < sql/upgrade-2026-09-09-sources.sql（路径以部署目录为准）。"
+                . "\n\n或直接运行：mysql -uroot -p < sql/upgrade-2026-09-17-search-keywords.sql（路径以部署目录为准）。"
                 . '执行后刷新本页即可；若 worker/collect 为常驻进程，请重启以刷新列缓存。',
                 200, 1
             );
@@ -500,6 +501,55 @@ class StatsController
             $args
         );
 
+        // ---- 搜索引擎来路关键词（kw 由采集端从 ref 提取，未提取到=「未提供」） ----
+        // ref_host → 引擎品牌归并在 PHP 做（www.baidu.com / m.baidu.com → baidu）。
+        // 引擎级 UV 用 ref_host 精确去重；关键词级 UV 用 (ref_host, kw) 精确去重，
+        // 两者跨行相加都可能高估（同一访客多词/多 host），故只作为上界口径在页面说明。
+        $terms = [];
+        $engineRows = [];   // host => ['pv'=>n, 'uv'=>n, 'no_kw_pv'=>n]
+        foreach (
+            Db::select(
+                "SELECT ref_host host, kw, COUNT(*) pv, COUNT(DISTINCT visitor_id) uv
+                 FROM events WHERE $w AND source='search' GROUP BY ref_host, kw",
+                $args
+            ) as $r
+        ) {
+            $host = (string) $r['host'];
+            $kw = trim((string) $r['kw']);
+            $pv = (int) $r['pv'];
+            if ($kw === '') {
+                $engineRows[$host]['no_kw_pv'] = ($engineRows[$host]['no_kw_pv'] ?? 0) + $pv;
+                continue;
+            }
+            $terms[] = ['engine' => $host !== '' ? Referrer::brand($host) : 'other', 'kw' => $kw, 'pv' => $pv, 'uv' => (int) $r['uv']];
+        }
+        foreach (
+            Db::select(
+                "SELECT ref_host host, COUNT(*) pv, COUNT(DISTINCT visitor_id) uv
+                 FROM events WHERE $w AND source='search' GROUP BY ref_host",
+                $args
+            ) as $r
+        ) {
+            $host = (string) $r['host'];
+            $engineRows[$host]['pv'] = (int) $r['pv'];
+            $engineRows[$host]['uv'] = (int) $r['uv'];
+        }
+        $engines = [];
+        $noKwPv = 0;
+        foreach ($engineRows as $host => $row) {
+            $engine = $host !== '' ? Referrer::brand($host) : 'other';
+            if (!isset($engines[$engine])) {
+                $engines[$engine] = ['engine' => $engine, 'pv' => 0, 'uv' => 0];
+            }
+            $engines[$engine]['pv'] += (int) ($row['pv'] ?? 0);
+            $engines[$engine]['uv'] = max($engines[$engine]['uv'], (int) ($row['uv'] ?? 0));
+            $noKwPv += (int) ($row['no_kw_pv'] ?? 0);
+        }
+        $enginesOut = array_values($engines);
+        usort($enginesOut, fn ($a, $b) => $b['pv'] - $a['pv']);
+        usort($terms, fn ($a, $b) => $b['pv'] - $a['pv'] ?: $b['uv'] - $a['uv']);
+        $terms = array_slice($terms, 0, 100);
+
         // 说明：UTM 投放系列与广告平台（ClickID）已统一归口「广告追踪」页（/api/stats/ads），
         // 本接口不再返回 campaigns / ads，避免同一批数据两处展示、口径分裂。
 
@@ -510,6 +560,9 @@ class StatsController
             'channels' => array_map(fn ($tp) => ['type' => $tp, 'pv' => $ch[$tp]], $types),
             'trend' => ['days' => $days, 'data' => $trendData],
             'referrers' => $referrers,
+            'engines' => $enginesOut,
+            'terms' => $terms,
+            'no_kw_pv' => $noKwPv,
         ]);
     }
 
@@ -676,6 +729,105 @@ class StatsController
             }
         }
         wstat_json(['session' => $sess, 'events' => $events, 'visitor' => $vs, 'now' => time()]);
+    }
+
+    /**
+     * GET /api/stats/iptrace?site_id=&start=&end=&q=&page=&size=
+     * IP 追踪溯源：按 IP 聚合会话（地域 / 会话数 / PV / 访客数 / 首末访问），
+     * 附渠道构成（sessions.source）与主要来路主机（events.ref_host TOP）。
+     * 展开轨迹由前端复用 /api/stats/sessions?q=<ip> 完成（该端点已支持按 IP 检索）。
+     */
+    public function iptrace(Request $req): void
+    {
+        $site = $this->own($req, (int) $req->input('site_id', 0));
+        [$start, $end] = $this->range($req, (string) $site['timezone']);
+        [$startTs, $endTs] = Util::dateRangeToTs($start, $end, (string) $site['timezone']);
+        $sid = (int) $site['id'];
+        $page = max(1, (int) $req->input('page', 1));
+        $size = min(100, max(1, (int) $req->input('size', 15)));
+        $q = trim((string) $req->input('q', ''));
+
+        // 老库缺 ip 列：给出明确迁移提示而非 SQLSTATE 500
+        if (!isset(Db::tableColumns('sessions')['ip'])) {
+            wstat_err(
+                'sessions 表缺少 ip 列。请执行升级：mysql -uroot -p <库名> < sql/upgrade-2026-09-09-sessions-ip.sql（路径以部署目录为准）。',
+                200, 1
+            );
+            return;
+        }
+
+        $where = "site_id=? AND start_ts>=? AND start_ts<? AND ip<>''";
+        $args = [$sid, $startTs, $endTs];
+        if ($q !== '') {
+            // IP 前缀匹配（112.10. 可框定网段，112.10.3.4 精确到点分前缀）
+            $where .= " AND ip LIKE ? ESCAPE '\\\\'";
+            $args[] = $this->likeEscape($q) . '%';
+        }
+
+        $total = (int) Db::value("SELECT COUNT(DISTINCT ip) FROM sessions WHERE $where", $args);
+        $rows = Db::select(
+            "SELECT ip,
+                    MAX(country) country, MAX(province) province, MAX(city) city,
+                    COUNT(*) sessions, COALESCE(SUM(pageviews),0) pv,
+                    COUNT(DISTINCT visitor_id) visitors,
+                    COALESCE(ROUND(AVG(duration)),0) avg_duration,
+                    MIN(start_ts) first_ts, MAX(start_ts) last_ts
+             FROM sessions WHERE $where
+             GROUP BY ip
+             ORDER BY last_ts DESC
+             LIMIT " . (($page - 1) * $size) . ",$size",
+            $args
+        );
+
+        if ($rows) {
+            $ips = array_map('strval', array_column($rows, 'ip'));
+            $ph = implode(',', array_fill(0, count($ips), '?'));
+
+            // 渠道构成（会话口径）
+            $mix = [];
+            foreach (
+                Db::select(
+                    "SELECT ip, source, COUNT(*) n FROM sessions
+                     WHERE site_id=? AND start_ts>=? AND start_ts<? AND ip IN ($ph)
+                     GROUP BY ip, source",
+                    array_merge([$sid, $startTs, $endTs], $ips)
+                ) as $r
+            ) {
+                $mix[(string) $r['ip']][(string) $r['source']] = (int) $r['n'];
+            }
+
+            // 主要来路主机（事件口径；老库无 ref_host 列时跳过）
+            $refs = [];
+            if (isset(Db::tableColumns('events')['ref_host'])) {
+                foreach (
+                    Db::select(
+                        "SELECT ip, ref_host, COUNT(*) n FROM events
+                         WHERE site_id=? AND `day` BETWEEN ? AND ? AND type='pageview'
+                           AND ip IN ($ph) AND ref_host<>''
+                         GROUP BY ip, ref_host ORDER BY n DESC LIMIT 500",
+                        array_merge([$sid, $start, $end], $ips)
+                    ) as $r
+                ) {
+                    $rip = (string) $r['ip'];
+                    $refs[$rip][(string) $r['ref_host']] = ($refs[$rip][(string) $r['ref_host']] ?? 0) + (int) $r['n'];
+                }
+            }
+
+            foreach ($rows as &$row) {
+                $ip = (string) $row['ip'];
+                $srcMix = $mix[$ip] ?? [];
+                arsort($srcMix);
+                $row['source_mix'] = $srcMix;
+                $refMap = $refs[$ip] ?? [];
+                arsort($refMap);
+                $topRef = array_slice($refMap, 0, 1, true);
+                $row['top_ref_host'] = $topRef ? (string) array_key_first($topRef) : '';
+                $row['top_ref_pv'] = $topRef ? (int) reset($topRef) : 0;
+            }
+            unset($row);
+        }
+
+        wstat_json(['items' => $rows, 'total' => $total, 'page' => $page, 'size' => $size]);
     }
 
     /** GET /api/stats/online?site_id=  当前在线访客（近5分钟活跃） */

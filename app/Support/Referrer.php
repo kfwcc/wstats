@@ -13,6 +13,7 @@ class Referrer
     public const SEARCH = [
         'baidu.com', 'google.', 'bing.com', 'so.com', 'sogou.com', 'sm.cn', 'yahoo.',
         'yandex.', 'duckduckgo.com', 'ecosia.org', 'ask.com', 'yisou.com', 'toutiao.com/search',
+        'chinaso.com', 'petalsearch.com',
     ];
 
     public const SOCIAL = [

@@ -21,6 +21,7 @@ use Wstat\Support\RateLimiter;
 use Wstat\Support\Rds;
 use Wstat\Support\RedisGuard;
 use Wstat\Support\Referrer;
+use Wstat\Support\SearchEngine;
 use Wstat\Support\Sessionizer;
 use Wstat\Support\Settings;
 use Wstat\Support\SiteStore;
@@ -70,6 +71,26 @@ class CollectController
         $url = self::safeUrl((string) $req->input('url', ''), 600);
         $title = self::cut((string) $req->input('title', ''), 255);
         $ref = self::safeUrl((string) $req->input('ref', ''), 600);
+
+        // ---- 301/302 来源保真：跳板跳转时以 ?wstat_ref=<真源> 携带。
+        // SDK v1.5+ 已优先上报并从 url 剔除该参数；旧版 SDK 仍会把它留在 url 里 ——
+        // 这里兜底提取，并从存库 url 中剔除以免污染页面明细。
+        // wstat_ref 是跳板显式声明的完整真源，信息量 ≥ 被浏览器按 Referrer-Policy
+        // 裁剪的 referrer（跨域往往只剩 origin），与 UTM 同属「客户端声明、只影响归因」
+        // 的信任级别 —— 存在即采信。
+        $uParts = parse_url($url);
+        if (is_array($uParts) && !empty($uParts['query']) && strpos($uParts['query'], 'wstat_ref=') !== false) {
+            $wref = '';
+            parse_str($uParts['query'], $uq);
+            if (isset($uq['wstat_ref']) && is_string($uq['wstat_ref'])) {
+                $wref = self::safeUrl($uq['wstat_ref'], 600);
+            }
+            $qs = trim((string) preg_replace('/(^|&)wstat_ref=[^&]*/', '', (string) $uParts['query']), '&');
+            $url = (string) ($uParts['path'] ?? '') . ($qs !== '' ? '?' . $qs : '');
+            if ($wref !== '') {
+                $ref = $wref;
+            }
+        }
         $screen = self::cut((string) $req->input('scr', ''), 24);
         $lang = self::cut((string) $req->input('lang', ''), 16);
         $tzMin = (int) $req->input('tz', 0);
@@ -148,6 +169,8 @@ class CollectController
             'click_id' => $clickId,
             'click_source' => $clickSource,
             'ref_host' => (string) ($cls['host'] ?? ''),
+            // 搜索引擎来路关键词：仅 search 来源从 ref 提取（拿不到=空，报表归「未提供」）
+            'kw' => $cls['type'] === 'search' ? SearchEngine::kw($ref) : '',
             'payload' => $payload,
         ];
 
