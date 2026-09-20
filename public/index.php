@@ -11,12 +11,14 @@ declare(strict_types=1);
 
 use Wstat\Controllers\AlertController;
 use Wstat\Controllers\AuthController;
+use Wstat\Controllers\BrandController;
 use Wstat\Controllers\CollectController;
 use Wstat\Controllers\ExportController;
 use Wstat\Controllers\OpenController;
 use Wstat\Controllers\ProfileController;
 use Wstat\Controllers\SiteController;
 use Wstat\Controllers\SettingController;
+use Wstat\Controllers\SpiderController;
 use Wstat\Controllers\StatsController;
 use Wstat\Controllers\TokenController;
 use Wstat\Controllers\UserController;
@@ -33,13 +35,28 @@ $wstatBoot = dirname(__DIR__) . '/app/bootstrap.php';
 if (!@is_file($wstatBoot)) {
     $wstatBoot = __DIR__ . '/app/bootstrap.php';
 }
-require $wstatBoot;
+// require_once：开发服 router.php 对非 API 路径（如 /brand/*）已先 require_once 引导做安装检查，
+// 这里若用 require 会二次声明 wstat_config() 直接 Fatal。引导文件本就只该加载一次。
+require_once $wstatBoot;
 
 /* ---------- 非 API 请求：未安装引导 + 前端单页回退 ---------- */
 $wstatPath = parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH);
 $wstatPath = is_string($wstatPath) && $wstatPath !== '' ? $wstatPath : '/';
 
 if (strpos($wstatPath, '/api') !== 0 && strpos($wstatPath, '/open') !== 0) {
+    // ---- 品牌图公开下发（/brand/logo、/brand/icon）：必须先于 SPA 回退分流 ----
+    // 否则会被下面的前端单页回退当成路由、返回 index.html。未设置时 BrandController 返回 404，
+    // 前端据此回落内置默认图标。
+    if ($wstatPath === '/brand/logo' || $wstatPath === '/brand/icon') {
+        wstat_guard_installed();
+        $brand = new BrandController();
+        if ($wstatPath === '/brand/logo') {
+            $brand->logo(new Request());
+        } else {
+            $brand->icon(new Request());
+        }
+        exit(0);
+    }
     if (!wstat_installed()) {
         // 安装向导本身不可用时给出明确说明，避免与「首页→向导」互相跳转成死循环
         if (strpos($wstatPath, '/install') === 0) {
@@ -123,6 +140,8 @@ $router->group('/api', function (Router $r) {
     $r->get('/settings', [$sys, 'show']);
     $r->patch('/settings', [$sys, 'update']);
     $r->post('/settings/email-test', [$sys, 'emailTest']);
+    // 品牌图上传 / 复位（multipart；文件落 data/brand/，见 SettingController::brand()）
+    $r->post('/settings/brand', [$sys, 'brand']);
     $r->get('/settings/version', [$sys, 'version']);
     $r->post('/settings/update', [$sys, 'applyUpdate']);   // 一键升级（地址由服务端决定）
     // 真实 IP 采集自检（套了 CDN / 反代后访客 IP 不对时用来定位，见控制器注释）
@@ -139,6 +158,7 @@ $router->group('/api', function (Router $r) {
     $r->delete('/sites/{id}', [$site, 'destroy']);
     $r->get('/sites/{id}/verify-file', [$site, 'verifyFile']);
     $r->post('/sites/{id}/verify', [$site, 'verify']);
+    $r->get('/sites/{id}/sdk-check', [$site, 'sdkCheck']);
     // ---- 站点协作成员（仅所有者可管理） ----
     $r->get('/sites/{id}/members', [$site, 'members']);
     $r->post('/sites/{id}/members', [$site, 'memberAdd']);
@@ -151,8 +171,15 @@ $router->group('/api', function (Router $r) {
     $st = new StatsController();
     $r->get('/stats/overview', [$st, 'overview']);
     $r->get('/stats/sources', [$st, 'sources']);
+    $r->get('/stats/engines', [$st, 'engines']);   // 搜索引擎统计（引擎/趋势/落地页/关键词）
     $r->get('/stats/sessions', [$st, 'sessions']);
     $r->get('/stats/sessions/{id}', [$st, 'sessionDetail']);
+    $r->get('/stats/iptrace', [$st, 'iptrace']);
+
+    // ---- 蜘蛛爬虫统计（只读；记账走 /spider.php 与采集端，与访客口径完全隔离） ----
+    $sp = new SpiderController();
+    $r->get('/stats/spiders', [$sp, 'stats']);
+
     $r->get('/stats/online', [$st, 'online']);
     $r->get('/stats/all-sites', [$st, 'allSites']);
     $r->get('/stats/auto-events', [$st, 'autoEvents']);

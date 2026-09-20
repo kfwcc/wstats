@@ -15,6 +15,9 @@
  *   smtp_from_name / smtp_from_email            邮件发信配置（email 渠道与测试邮件共用）
  *   retention_days        ''   事件明细保留天数；空=跟随 config.php 的 collect.event_retention
  *   bot_filter_enabled    1/0  爬虫过滤开关（开启时采集端丢弃 UA 命中的爬虫/HTTP 客户端）
+ *                              —— 关闭后爬虫会计入普通访客口径；无论开关如何，
+ *                              爬虫命中都会另行记账到 spider_hits（见下方 spider_enabled）
+ *   spider_enabled        1/0  蜘蛛爬虫统计开关（关闭后服务端上报端点与采集端都不再记 spider_hits）
  *   email_verify_enabled  1/0  注册需邮箱验证码（取码前还须通过图形验证码，见 Support\Verify）
  *   screen_password       ''   数据大屏访问密码；空=不启用（大屏链接仅靠只读 token 保护）
  *   sdk_snippet           ''   自定义「站点接入代码」模板；空=用内置默认 SDK_SNIPPET_DEFAULT
@@ -25,6 +28,15 @@
  *                              x_forwarded_for | x_real_ip | remote_addr | custom
  *                              见 Support\Util::IP_SOURCES 与 ipTrace()
  *   ip_source_header      ''   ip_source=custom 时取哪个请求头（如 CF-Connecting-IP）
+ *   brand_logo            ''   面板 Logo 文件名（存 data/brand/ 下；空=用内置默认）。
+ *                              文件本体随 data/ 目录持久（升级永不覆盖），公开经 /brand/logo 下发
+ *   brand_icon            ''   浏览器标签页图标（favicon）文件名；同上，公开经 /brand/icon 下发
+ *   brand_name            ''   系统名称：侧栏 / 登录注册页标题 / 浏览器标签页标题。空=用内置默认文案
+ *   meta_keywords         ''   页面 <meta name="keywords">，SEO 收录用；空=不输出
+ *   meta_description      ''   页面 <meta name="description">；空=不输出
+ *   hidden_menus          ''   被关闭的菜单（路由 key）逗号串，如 '/spiders,/heatmap'。
+ *                              侧栏隐藏 + 直连地址 404；系统管理员不受限（否则关掉「系统设置」
+ *                              就没人能再打开它了）。空串=全部显示
  */
 declare(strict_types=1);
 
@@ -48,8 +60,15 @@ class Settings
         'alert_enabled'        => '1',
         'retention_days'       => '',
         'bot_filter_enabled'   => '1',
+        'spider_enabled'       => '1',
         'email_verify_enabled' => '1',
         'screen_password'      => '',
+        'brand_logo'           => '',
+        'brand_icon'           => '',
+        'brand_name'           => '',
+        'meta_keywords'        => '',
+        'meta_description'     => '',
+        'hidden_menus'         => '',
         'sdk_snippet'          => '',
         'inject_code'          => '',
         'smtp_host'            => '',
@@ -64,11 +83,30 @@ class Settings
     /** 设置项白名单（与 DEFAULTS 键一致） */
     public const KEYS = [
         'registration_enabled', 'collect_enabled', 'alert_enabled', 'retention_days',
-        'bot_filter_enabled', 'email_verify_enabled', 'screen_password', 'sdk_snippet', 'inject_code',
+        'bot_filter_enabled', 'spider_enabled', 'email_verify_enabled', 'screen_password', 'sdk_snippet', 'inject_code',
         'ip_source', 'ip_source_header',
         'smtp_host', 'smtp_port', 'smtp_secure', 'smtp_username', 'smtp_password',
         'smtp_from_name', 'smtp_from_email',
+        'brand_logo', 'brand_icon', 'brand_name', 'meta_keywords', 'meta_description', 'hidden_menus',
     ];
+
+    /** 品牌图允许的扩展名（与 MIME 一一对应校验，见 SettingController::brand()） */
+    public const BRAND_EXTS = ['png', 'jpg', 'jpeg', 'svg', 'ico', 'webp'];
+
+    /** 品牌 Logo 大小上限（字节） */
+    public const BRAND_LOGO_MAX = 1048576;   // 1MB
+
+    /** 品牌 Icon（favicon）大小上限（字节） */
+    public const BRAND_ICON_MAX = 262144;    // 256KB
+
+    /** 系统名称长度上限（侧栏 / 登录页 / 浏览器标签页标题） */
+    public const BRAND_NAME_MAX = 40;
+
+    /** meta 关键词长度上限 */
+    public const META_KEYWORDS_MAX = 200;
+
+    /** meta 简介长度上限 */
+    public const META_DESCRIPTION_MAX = 300;
 
     /**
      * 内置的「站点接入代码」模板（管理员未自定义时使用）。
@@ -168,6 +206,42 @@ class Settings
     public static function sdkSnippetIsCustom(): bool
     {
         return trim(self::get('sdk_snippet')) !== '';
+    }
+
+    /**
+     * 品牌图存储目录（data/brand/）：data/ 在升级时永不覆盖（Updater 白名单），
+     * 上传的 Logo / Icon 因此跨版本存活；目录惰性创建。
+     */
+    public static function brandDir(): string
+    {
+        $dir = WSTAT_ROOT . '/data/brand';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+        return $dir;
+    }
+
+    /**
+     * 被关闭的菜单（路由 key 列表）。
+     * 存储是逗号分隔串；这里只拆分与做格式过滤（合法 key 形如 /overview、/all-sites），
+     * 是否真实存在的路由交给前端判断（前端持有路由表）。
+     *
+     * @return string[]
+     */
+    public static function hiddenMenus(): array
+    {
+        $raw = trim(self::get('hidden_menus'));
+        if ($raw === '') {
+            return [];
+        }
+        $out = [];
+        foreach (explode(',', $raw) as $k) {
+            $k = trim($k);
+            if ($k !== '' && preg_match('#^/[a-z0-9-]+$#', $k) === 1 && !in_array($k, $out, true)) {
+                $out[] = $k;
+            }
+        }
+        return $out;
     }
 
     /**

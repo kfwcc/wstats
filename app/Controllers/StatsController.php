@@ -566,6 +566,184 @@ class StatsController
         ]);
     }
 
+    /**
+     * GET /api/stats/engines —— 搜索引擎统计（专页 /engines）。
+     *
+     * 与 `/api/stats/sources` 的关系：来源分析页给的是「渠道大盘 + 引擎徽章 + 关键词」，
+     * 本接口把「搜索引擎」这一个渠道单独做深：引擎排行（PV/UV/会话/关键词可见率）、
+     * 引擎×日趋势、搜索落地页 TOP、关键词 TOP。
+     *
+     * 口径要点：
+     *  - 引擎归并：`events.ref_host` → 主域二级名（www.baidu.com / m.baidu.com → baidu），
+     *    在 PHP 侧聚合（与来源分析页共用 `Referrer::brand()`），库里不冗余存引擎名；
+     *  - UV 一律**精确去重**：引擎级 UV 取同一引擎各 host 的最大值（相加会高估），
+     *    概览级 UV/会话在整段区间上直接 COUNT(DISTINCT)，不做跨引擎相加；
+     *  - 关键词拿不到是**常态而非故障**（Google 全站加密、浏览器默认 Referrer-Policy
+     *    跨站只送 origin、百度 link?url= 包装）→ 单列「未提供」计数，不掩盖。
+     */
+    public function engines(Request $req): void
+    {
+        $site = $this->own($req, (int) $req->input('site_id', 0));
+        [$start, $end] = $this->range($req, (string) $site['timezone']);
+        [$startTs, $endTs] = Util::dateRangeToTs($start, $end, (string) $site['timezone']);
+        $sid = (int) $site['id'];
+        $tz = (string) $site['timezone'];
+
+        // 老库预检：搜索词/来源主机列缺失时给出可执行的修复提示，而不是抛 500
+        $cols = Db::tableColumns('events');
+        $missing = [];
+        foreach (['ref_host', 'kw'] as $need) {
+            if (!isset($cols[$need])) {
+                $missing[] = $need;
+            }
+        }
+        if ($missing) {
+            wstat_err(
+                'events 表缺少来源分析列：' . implode(', ', $missing) . "。请在数据库执行升级：\n\n"
+                . "ALTER TABLE `events`\n  ADD COLUMN `ref_host` VARCHAR(255) NOT NULL DEFAULT '' AFTER `click_source`,\n"
+                . "  ADD COLUMN `kw`       VARCHAR(255) NOT NULL DEFAULT '' AFTER `ref_host`;\n\n"
+                . '或直接运行：mysql -uroot -p < sql/upgrade-2026-09-17-search-keywords.sql（路径以部署目录为准）。'
+                . '执行后刷新本页即可；若 worker/collect 为常驻进程，请重启以刷新列缓存。',
+                200,
+                1
+            );
+            return;
+        }
+
+        $w = 'site_id=? AND type="pageview" AND `day` BETWEEN ? AND ?';
+        $args = [$sid, $start, $end];
+
+        // 全站 PV（分母：搜索渠道占比）
+        $totalPv = (int) Db::value("SELECT COUNT(*) FROM events WHERE $w", $args);
+
+        // 搜索渠道总量（精确去重，不跨引擎相加）
+        $search = Db::first(
+            "SELECT COUNT(*) pv, COUNT(DISTINCT visitor_id) uv, COUNT(DISTINCT session_id) sv
+             FROM events WHERE $w AND source='search'",
+            $args
+        ) ?: [];
+        $kwPv = (int) Db::value("SELECT COUNT(*) FROM events WHERE $w AND source='search' AND kw<>''", $args);
+
+        // 引擎 × 关键词明细（一次查询同时喂「引擎排行」与「关键词 TOP」）
+        $eng = [];       // brand => ['pv','uv','sv','kw_pv','no_kw_pv','top_kw','top_kw_pv']
+        $terms = [];
+        foreach (
+            Db::select(
+                "SELECT ref_host host, kw, COUNT(*) pv, COUNT(DISTINCT visitor_id) uv, COUNT(DISTINCT session_id) sv
+                 FROM events WHERE $w AND source='search' GROUP BY ref_host, kw",
+                $args
+            ) as $r
+        ) {
+            $host = (string) $r['host'];
+            $brand = $host !== '' ? Referrer::brand($host) : 'other';
+            $pv = (int) $r['pv'];
+            if (!isset($eng[$brand])) {
+                $eng[$brand] = ['engine' => $brand, 'pv' => 0, 'uv' => 0, 'sv' => 0, 'kw_pv' => 0, 'no_kw_pv' => 0, 'top_kw' => '', 'top_kw_pv' => 0];
+            }
+            $eng[$brand]['pv'] += $pv;
+            $eng[$brand]['uv'] = max($eng[$brand]['uv'], (int) $r['uv']);
+            $eng[$brand]['sv'] = max($eng[$brand]['sv'], (int) $r['sv']);
+
+            $kw = trim((string) $r['kw']);
+            if ($kw === '') {
+                $eng[$brand]['no_kw_pv'] += $pv;
+                continue;
+            }
+            $eng[$brand]['kw_pv'] += $pv;
+            if ($pv > $eng[$brand]['top_kw_pv']) {
+                $eng[$brand]['top_kw_pv'] = $pv;
+                $eng[$brand]['top_kw'] = $kw;
+            }
+            $terms[] = ['engine' => $brand, 'kw' => $kw, 'pv' => $pv, 'uv' => (int) $r['uv']];
+        }
+        $engines = array_values($eng);
+        usort($engines, static fn (array $a, array $b): int => $b['pv'] <=> $a['pv']);
+        $searchPv = (int) ($search['pv'] ?? 0);
+        foreach ($engines as $i => $e) {
+            $engines[$i]['share'] = $searchPv > 0 ? round($e['pv'] * 100 / $searchPv, 1) : 0.0;
+            $engines[$i]['kw_rate'] = $e['pv'] > 0 ? round($e['kw_pv'] * 100 / $e['pv'], 1) : 0.0;
+        }
+        usort($terms, static fn (array $a, array $b): int => $b['pv'] <=> $a['pv'] ?: $b['uv'] <=> $a['uv']);
+        $terms = array_slice($terms, 0, 100);
+
+        // 引擎 × 日趋势：TOP6 引擎单列，其余 + 未归并的 host 统一并入 other
+        $days = [];
+        foreach (Util::dailySeries($startTs, $endTs, $tz, static fn () => null) as $d => $_) {
+            $days[] = (string) $d;
+        }
+        $dayIdx = array_flip($days);
+        $topBrands = array_slice(array_column($engines, 'engine'), 0, 6);
+        $series = [];
+        foreach ($topBrands as $b) {
+            $series[$b] = array_fill(0, count($days), 0);
+        }
+        $series['__other__'] = array_fill(0, count($days), 0);
+        $totals = array_fill(0, count($days), 0);
+        foreach (
+            Db::select(
+                "SELECT `day` d, ref_host host, COUNT(*) pv
+                 FROM events WHERE $w AND source='search' GROUP BY `day`, ref_host ORDER BY d",
+                $args
+            ) as $r
+        ) {
+            $i = $dayIdx[(string) $r['d']] ?? -1;
+            if ($i < 0) {
+                continue;
+            }
+            $pv = (int) $r['pv'];
+            $totals[$i] += $pv;
+            $host = (string) $r['host'];
+            $brand = $host !== '' ? Referrer::brand($host) : 'other';
+            $key = isset($series[$brand]) ? $brand : '__other__';
+            $series[$key][$i] += $pv;
+        }
+        $seriesRows = [];
+        foreach ($series as $b => $vals) {
+            $seriesRows[] = ['engine' => $b === '__other__' ? '' : $b, 'other' => $b === '__other__', 'data' => $vals];
+        }
+
+        // 搜索落地页 TOP —— 取会话入口页（sessions.entry_url），口径是「从搜索引擎进来落在哪」
+        $landing = [];
+        $scols = Db::tableColumns('sessions');
+        if (isset($scols['entry_url']) && isset($scols['source'])) {
+            foreach (
+                Db::select(
+                    "SELECT entry_url url, COUNT(*) sv, COUNT(DISTINCT visitor_id) uv
+                     FROM sessions
+                     WHERE site_id=? AND source='search' AND start_ts>=? AND start_ts<?
+                     GROUP BY entry_url ORDER BY sv DESC LIMIT 20",
+                    [$sid, $startTs, $endTs]
+                ) as $r
+            ) {
+                $landing[] = [
+                    'url' => (string) $r['url'],
+                    'sv'  => (int) $r['sv'],
+                    'uv'  => (int) $r['uv'],
+                ];
+            }
+        }
+
+        wstat_json([
+            'site'    => $this->siteShape($site),
+            'range'   => ['start' => $start, 'end' => $end],
+            'summary' => [
+                'total_pv'   => $totalPv,
+                'search_pv'  => $searchPv,
+                'search_uv'  => (int) ($search['uv'] ?? 0),
+                'search_sv'  => (int) ($search['sv'] ?? 0),
+                'kw_pv'      => $kwPv,
+                'no_kw_pv'   => max(0, $searchPv - $kwPv),
+                'engines'    => count($engines),
+                'share'      => $totalPv > 0 ? round($searchPv * 100 / $totalPv, 1) : 0.0,
+                'terms'      => count($terms),
+            ],
+            'engines' => $engines,
+            'trend'   => ['days' => $days, 'series' => $seriesRows, 'totals' => $totals],
+            'landing' => $landing,
+            'terms'   => $terms,
+        ]);
+    }
+
     /** GET /api/stats/sessions?site_id=&page=&size=&start=&end=&q= */
     public function sessions(Request $req): void
     {
@@ -1457,18 +1635,27 @@ class StatsController
             return $out;
         };
 
-        // sessions 维度（入口/退出 URL：PV=SUM(pageviews)，idx_site_start 索引）
+        // sessions 维度（入口/退出 URL：PV=SUM(pageviews)，idx_site_start 索引；
+        // 实时合并「打开中会话」——关闭落库时移出 live 集合，与上表不重复）
         $sess = function (string $col) use ($sid, $startTs, $endTs, $pct): array {
-            $rows = Db::select(
-                "SELECT `$col` AS name, COALESCE(SUM(pageviews),0) AS pv
-                 FROM sessions WHERE site_id=? AND start_ts>=? AND start_ts<? AND `$col`<>''
-                 GROUP BY `$col` ORDER BY pv DESC LIMIT 50",
-                [$sid, $startTs, $endTs]
-            );
+            $agg = [];
+            foreach (
+                Db::select(
+                    "SELECT `$col` AS name, COALESCE(SUM(pageviews),0) AS pv
+                     FROM sessions WHERE site_id=? AND start_ts>=? AND start_ts<? AND `$col`<>''
+                     GROUP BY `$col` ORDER BY pv DESC LIMIT 50",
+                    [$sid, $startTs, $endTs]
+                ) as $r
+            ) {
+                $agg[(string) $r['name']] = (int) $r['pv'];
+            }
+            foreach (($this->liveEntryExit($sid, $startTs, $endTs)[$col] ?? []) as $name => $c) {
+                $agg[(string) $name] = ($agg[(string) $name] ?? 0) + (int) $c['pv'];
+            }
+            arsort($agg);
             $out = [];
-            foreach ($rows as $r) {
-                $pv = (int) $r['pv'];
-                $out[] = ['name' => (string) $r['name'], 'pv' => $pv, 'pct' => $pct($pv)];
+            foreach (array_slice($agg, 0, 50, true) as $name => $pv) {
+                $out[] = ['name' => $name, 'pv' => $pv, 'pct' => $pct($pv)];
             }
             return $out;
         };
@@ -1591,6 +1778,18 @@ class StatsController
             "SELECT COUNT(*) FROM sessions WHERE site_id=? AND start_ts>=? AND start_ts<? AND $exitCond",
             [$sid, $startTs, $endTs, $entryVal]
         );
+        // 实时合并「打开中会话」（尚未结算落库，关闭后自动并入上表口径）
+        $liveEE = $this->liveEntryExit($sid, $startTs, $endTs);
+        foreach ($liveEE['entry_url'] as $u => $c) {
+            if ($match === 'prefix' ? str_starts_with($u, $url) : $u === $url) {
+                $entryCnt += (int) $c['visits'];
+            }
+        }
+        foreach ($liveEE['exit_url'] as $u => $c) {
+            if ($match === 'prefix' ? str_starts_with($u, $url) : $u === $url) {
+                $exitCnt += (int) $c['visits'];
+            }
+        }
 
         // ---- 3) 趋势：按天 / 按小时 ----
         $trend = [];
@@ -1820,7 +2019,7 @@ class StatsController
             $freqMap[$k] += (int) $r['c'];
         }
 
-        // ---- 访问维度：入口/出口页排名 TOP10（访问次数 + PV） ----
+        // ---- 访客维度：入口/出口页排名 TOP10（访问次数 + PV；实时合并打开中会话） ----
         $pageRank = function (string $col) use ($w, $args): array {
             $rows = Db::select(
                 "SELECT `$col` AS name, COUNT(*) AS visits, COALESCE(SUM(pageviews),0) AS pv
@@ -1834,6 +2033,9 @@ class StatsController
             }
             return $out;
         };
+        $liveEE = $this->liveEntryExit($sid, $startTs, $endTs);
+        $entries = $this->mergeLiveRank($pageRank('entry_url'), $liveEE['entry_url'], 'visits', 10);
+        $exits = $this->mergeLiveRank($pageRank('exit_url'), $liveEE['exit_url'], 'visits', 10);
 
         // ---- 访客维度：地域/浏览器/OS/设备/屏幕/语言 TOP10（按去重访客数） ----
         $dim = function (string $col) use ($w, $args): array {
@@ -1886,8 +2088,8 @@ class StatsController
             'duration_dist' => $durMap,   // {d0_10, d11_30, d31_60, d1_3, d3_10, d10m}
             'depth_dist' => $depthMap,    // {p1, p2_3, p4_6, p7_10, p10m}
             'freq_dist' => $freqMap,      // {f1, f2, f3_5, f6_10, f10m} 单位=访客数
-            'entries' => $pageRank('entry_url'),  // [{name, visits, pv}]
-            'exits' => $pageRank('exit_url'),
+            'entries' => $entries,
+            'exits' => $exits,
             'geo' => $geo,                // [{name, c}] 以下均按去重访客数
             'browsers' => $dim('browser'),
             'oses' => $dim('os'),
@@ -1898,6 +2100,70 @@ class StatsController
     }
 
     /* ================= 内部 ================= */
+
+    /**
+     * 打开中会话（尚未结算落库）的入口/出口聚合计数，供排名类接口做实时合并。
+     * 返回 ['entry_url' => [url => ['visits'=>n, 'pv'=>sum(pageviews)]], 'exit_url' => [...]]；
+     * 无 Redis / Redis 异常时各表为空数组（调用方零开销直通，降级模式自然无此数据）。
+     * 会话在关闭落库时同步移出 live 集合，因此与 sessions 表统计天然不重复计数。
+     */
+    private function liveEntryExit(int $sid, int $startTs, int $endTs): array
+    {
+        $empty = ['entry_url' => [], 'exit_url' => []];
+        if (!Rds::enabled()) {
+            return $empty;
+        }
+        return Rds::safe(function ($r) use ($sid, $startTs, $endTs) {
+            $out = ['entry_url' => [], 'exit_url' => []];
+            foreach (Sessionizer::liveRows($r, $sid, $startTs, $endTs) as $row) {
+                $pv = max(1, (int) ($row['pageviews'] ?? 1));
+                foreach (['entry_url', 'exit_url'] as $col) {
+                    $v = (string) ($row[$col] ?? '');
+                    if ($v === '') {
+                        continue;
+                    }
+                    if (!isset($out[$col][$v])) {
+                        $out[$col][$v] = ['visits' => 0, 'pv' => 0];
+                    }
+                    $out[$col][$v]['visits']++;
+                    $out[$col][$v]['pv'] += $pv;
+                }
+            }
+            return $out;
+        }, $empty);
+    }
+
+    /**
+     * 排名行合并打开中会话计数：$liveMap 形如 [name => [字段名 => 增量]]，
+     * 按 $sortKey 降序重排并截断到 $limit（与各接口原 SQL LIMIT 口径一致）。
+     */
+    private function mergeLiveRank(array $rows, array $liveMap, string $sortKey, int $limit): array
+    {
+        if (!$liveMap) {
+            return $rows;
+        }
+        $idx = [];
+        foreach ($rows as $i => $r) {
+            $idx[(string) $r['name']] = $i;
+        }
+        foreach ($liveMap as $name => $inc) {
+            if (isset($idx[$name])) {
+                $i = $idx[$name];
+                foreach ($inc as $k => $add) {
+                    $rows[$i][$k] = (int) ($rows[$i][$k] ?? 0) + (int) $add;
+                }
+            } else {
+                $idx[$name] = count($rows);
+                $row = ['name' => (string) $name];
+                foreach ($inc as $k => $add) {
+                    $row[$k] = (int) $add;
+                }
+                $rows[] = $row;
+            }
+        }
+        usort($rows, static fn (array $a, array $b): int => ((int) ($b[$sortKey] ?? 0)) <=> ((int) ($a[$sortKey] ?? 0)));
+        return array_slice($rows, 0, $limit);
+    }
 
     /** 无 Redis（DB 直写）模式：在线访客数（sessions.end_ts 近 5 分钟活跃；end_ts 随 pageview 刷新） */
     public static function onlineCountDb(int $sid, ?int $now = null): int
@@ -3136,9 +3402,9 @@ class StatsController
             }
             return $out;
         };
-        // 入口/退出页来自会话表（访问次数口径，与区间严格对齐）
+        // 入口/退出页来自会话表（访问次数口径，与区间严格对齐；实时合并打开中会话）
         $sessTop = function (string $col, int $limit = 10) use ($sid, $startTs, $endTs): array {
-            $out = [];
+            $agg = [];
             foreach (
                 Db::select(
                     "SELECT `$col` AS name, COUNT(*) pv FROM sessions
@@ -3147,7 +3413,15 @@ class StatsController
                     [$sid, $startTs, $endTs]
                 ) as $r
             ) {
-                $out[] = ['name' => (string) $r['name'], 'pv' => (int) $r['pv']];
+                $agg[(string) $r['name']] = (int) $r['pv'];
+            }
+            foreach (($this->liveEntryExit($sid, $startTs, $endTs)[$col] ?? []) as $name => $c) {
+                $agg[(string) $name] = ($agg[(string) $name] ?? 0) + (int) $c['visits'];
+            }
+            arsort($agg);
+            $out = [];
+            foreach (array_slice($agg, 0, $limit, true) as $name => $pv) {
+                $out[] = ['name' => $name, 'pv' => $pv];
             }
             return $out;
         };

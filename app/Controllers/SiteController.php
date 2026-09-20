@@ -235,6 +235,49 @@ class SiteController
     }
 
     /**
+     * GET /api/sites/{id}/sdk-check?since=<unix>  检测统计代码（SDK）是否生效
+     * 返回：
+     *  - count_since: since 之后收到的事件数（since=0 时为近两天事件数）
+     *  - last_ts    : 近两天窗口内最近一次事件时间（0=窗口内无数据）
+     *  - last_day   : 全历史最近有数据的天（site_daily，null=从未收到过任何数据）
+     * 查询走 idx_site_day 前缀：只扫 since 所在天与昨今两天，避免全表。
+     */
+    public function sdkCheck(Request $req): void
+    {
+        $site = $this->own($req, (int) $req->param('id'));
+        $sid = (int) $site['id'];
+        $now = time();
+        $since = max(0, (int) $req->input('since', 0));
+
+        // events.day 是站点本地日期：覆盖 [since, now] 最多跨两天（今天 + 昨天）
+        $tzMin = (int) round(Util::tzOffsetSec((string) $site['timezone']) / 60);
+        $days = [];
+        for ($t = ($since > 0 ? $since : $now) - 86400; $t <= $now + 60; $t += 86400) {
+            $d = Util::localDay($t, $tzMin);
+            $days[$d] = true;
+        }
+        $dayList = implode(',', array_fill(0, count($days), '?'));
+        $vals = array_values(array_map(fn ($d) => (string) $d, array_keys($days)));
+        array_unshift($vals, $sid, $since);
+
+        $row = Db::first(
+            "SELECT COUNT(*) AS c, COALESCE(MAX(ts),0) AS last_ts
+             FROM events WHERE site_id=? AND ts>=? AND day IN ($dayList)",
+            $vals
+        ) ?? ['c' => 0, 'last_ts' => 0];
+
+        // 全历史是否收过数据：site_daily 每站点每天一行，很小，直接取最近一天
+        $lastDay = Db::value('SELECT MAX(day) FROM site_daily WHERE site_id=?', [$sid]);
+
+        wstat_json([
+            'count_since' => (int) $row['c'],
+            'last_ts'     => (int) $row['last_ts'],
+            'last_day'    => $lastDay !== null ? (string) $lastDay : null,
+            'server_time' => $now,
+        ]);
+    }
+
+    /**
      * 当前用户可访问的站点（含归属/角色校验）。
      * 默认只读即可（VIEWER）；写操作显式传 SiteAccess::OWNER。
      */

@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS `events` (
   `utm_medium`  VARCHAR(128)    NOT NULL DEFAULT '',
   `click_source` VARCHAR(64)    NOT NULL DEFAULT '',     -- 广告平台名(Google Ads/Meta Ads...)
   `ref_host`    VARCHAR(255)    NOT NULL DEFAULT '',     -- 外链 referrer 主机名(去重聚合用)
+  `kw`          VARCHAR(255)    NOT NULL DEFAULT '',     -- 搜索引擎来路关键词(source=search 时从 ref 提取；拿不到置空=未提供)
   `campaign`    VARCHAR(128)    NOT NULL DEFAULT '',
   `content`     VARCHAR(128)    NOT NULL DEFAULT '',
   `term`        VARCHAR(128)    NOT NULL DEFAULT '',
@@ -401,6 +402,27 @@ CREATE TABLE IF NOT EXISTS `sys_settings` (
   `value`      TEXT         NULL,
   `updated_at` INT UNSIGNED NOT NULL DEFAULT 0,
   PRIMARY KEY (`name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- 蜘蛛抓取聚合表（蜘蛛爬虫统计；与访客口径完全隔离，不进 events/sessions）
+-- 一条 = 某站点某天某爬虫抓某个 URL 的累计次数；命中即 hits+1（upsert）
+-- url_md5 参与主键：utf8mb4 下把 VARCHAR(255) 放进主键在老 MariaDB(767B) 上会超限
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `spider_hits` (
+  `site_id`  INT UNSIGNED      NOT NULL,
+  `day`      DATE              NOT NULL,                 -- 站点本地日期
+  `spider`   VARCHAR(48)       NOT NULL,                 -- 归一化爬虫名（见 Support\Spider）
+  `url_md5`  CHAR(32)          NOT NULL,                 -- md5(被抓取路径)，主键用
+  `url`      VARCHAR(255)      NOT NULL DEFAULT '',      -- 被抓取路径（已清洗，不含协议/主机/锚点）
+  `hits`     INT UNSIGNED      NOT NULL DEFAULT 0,       -- 抓取次数
+  `bytes`    BIGINT UNSIGNED   NOT NULL DEFAULT 0,       -- 累计响应字节（拿不到为 0）
+  `status`   SMALLINT UNSIGNED NOT NULL DEFAULT 0,       -- 最近一次响应状态码（拿不到为 0）
+  `first_ts` INT UNSIGNED      NOT NULL DEFAULT 0,       -- 首次抓取时间
+  `last_ts`  INT UNSIGNED      NOT NULL DEFAULT 0,       -- 最近抓取时间
+  PRIMARY KEY (`site_id`, `day`, `spider`, `url_md5`),
+  KEY `idx_site_day`    (`site_id`, `day`),
+  KEY `idx_site_spider` (`site_id`, `spider`, `day`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- =====================================================================

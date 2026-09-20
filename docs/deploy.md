@@ -24,6 +24,7 @@
 
 ### 2.0 目录布局（先确认这一件事）
 
+v1.0.1 起发布包：
 
 ```
 <包根>/                        站点目录，例：/www/wwwroot/webstats
@@ -36,6 +37,7 @@
 │   ├── index.html assets/ geo/ sdk/
 │   └── install/               安装向导（安装完成后请删除）
 ├── scripts/                   worker.php / cron.php / doctor.php / geo-doctor.php / selfcheck.php / fetch-geo.php
+├── sql/                       install.sql（幂等全量建表）+ upgrade-*.sql（增量升级）
 └── deploy/  docs/deploy.md  README.md  RELEASE.md  CHANGELOG.md
 ```
 
@@ -63,7 +65,8 @@ WSTAT_SQL_FILE → 项目根/sql/ → 项目根/server/sql/ → 安装器目录/
               → Web根/sql/ → 网站同级目录/sql/ → 上一级目录/sql/
 ```
 
-> 发布包已在 `public/install/sql/install.sql` **自带一份**建表脚本
+> 发布包已在 `public/install/sql/install.sql` **自带一份**建表脚本，
+> 因此即使 `sql/` 被放到别处，安装也不会失败。
 
 ### 方式 A：Web 安装向导（推荐）
 
@@ -284,7 +287,23 @@ worker 的异常行为约定（便于 supervisor / 日志告警识别）：
 
 ### 6.1 升级
 
-面板「系统设置 → 关于与更新」会自动检查；
+升级服务地址：**https://wstats-update.kfw.cc/update.php**（面板「系统设置 → 关于与更新」会自动检查；
+`config.php` 的 `update_check_url` 可改指向自建服务，环境变量 `WSTAT_UPDATE_URL` 可覆盖）。
+
+#### 方式一：面板「一键升级」（推荐）
+
+系统设置 → 「关于与更新」→ 检查更新 → **一键升级**。服务端会：
+
+1. 从更新服务取回**增量包**（只含变化的程序文件 + `update.json` 清单 + 新增的 `sql/upgrade-*.sql`）；
+2. 逐条校验包内每个文件的 sha256，任一条不符即**整体中止**（不会出现半个新版本）；
+3. 把将被覆盖/删除的文件备份到 `data/backup/<新版本>-<时间>/`（含 `rollback.json`）；
+4. 覆盖 `app/` `public/` `scripts/` `sql/` 等程序文件 → 执行新增的增量 SQL → 把本次升级写进 `data/version.json`
+   （版本号本身**随代码走**：`app/version.php`（明文版本号）被覆盖即自动生效，
+   不再需要也不应该去改 `data/installed.php` 的 `version`）；
+5. 旧版本备份默认保留最近 3 份（`config.php` 的 `update.keep_backup`）。
+
+**一键升级永不触碰** `data/` 与 `config.php`；若你改过 `config.php`（与基线哈希不一致），
+新版本的默认配置会落在 `config.php.new`，需要你自己对比合并。
 
 > ⚠️ 升级后请**重启 worker 进程**（PHP 常驻进程不会热加载代码），并刷新面板页面。
 > 回滚：把 `data/backup/<目录>/` 下的文件按相同相对路径复制回包根即可。
@@ -301,6 +320,8 @@ worker 的异常行为约定（便于 supervisor / 日志告警识别）：
    合并配置时被显式忽略 —— v1.0.3 起它既不是判定依据，也不必手工同步
    （旧文档曾要求自行 `sed` 改它，那一步已删除；改与不改都不影响生效版本）；
 5. **重启 worker 进程**（否则仍跑旧代码）；
+6. 发布包内的 SDK 已自动混淆，无需手工同步；自建 SDK 时两处副本
+   （仓库根 `sdk/wstat.js` → `public/sdk/wstat.js`，以及 `frontend/sdk/wstat.js`）保持一致并清 CDN 缓存。
 
 ### 6.2 迁移
 
@@ -434,6 +455,19 @@ PV/UV、Top 页面、Top 来源等生成正文并推送。`last_sent_day` 做幂
     设置页与注册页都会给出红色提示；存储在 `data/verify/`（文件型，单机部署）。
   - **采集上报**：关闭后全部站点的 SDK 上报被拒（`/api/collect` 返回 403），已有数据仍可查看；
   - **告警与日报推送**：关闭后 `cron.php alert` / `cron.php report` 直接跳过（规则与订阅保留）。
+  - **爬虫过滤**（默认开）：命中爬虫 / HTTP 客户端 UA 的采集请求静默丢弃（返回 200 而非 403，
+    避免爬虫对 4xx 重试放大流量）；关闭后爬虫会计入普通访客口径。
+  - **蜘蛛爬虫统计**（默认开，v1.0.13 新增）：关闭后服务端上报端点 `/spider.php` 与采集端
+    都不再写 `spider_hits`（见 §8.19）。它与上一条**职责分离、互不影响** ——
+    「爬虫过滤」管*爬虫算不算访客*，「蜘蛛统计」管*要不要记蜘蛛账*；
+    任一开关都不会让爬虫数据混进 PV/UV/会话。
+- **事件明细保留天数**（`retention_days`，v1.0.13 新增可保存）：留空 = 跟随 `config.php` 的
+  `collect.event_retention`；非空必须是 **1–3650** 的整数（`cron.php clean` 直接拿它算分区删除边界）。
+  非法值返回 422 且**整批不落库**（不会留下「开关已改、天数没改」的半保存状态）。
+- **保存入口**：「功能开关」卡片自带保存按钮（v1.0.13 前必须滚到下方「接入代码」卡片才有保存按钮，
+  容易被当成「改了不保存」）。**开发约定**：`Settings::KEYS` / `DEFAULTS` 与前端 `save()` 里出现的键，
+  必须在 `SettingController::update()` 有对应写入分支 —— 只在白名单里登记、忘了写分支时，
+  服务端会静默丢弃该键（其余键照常落库 → 提示「保存成功」是真的，刷新后该项变回旧值）。
 - **邮件发送（SMTP）**：配置后，「告警渠道-邮件」「日报订阅邮件」「发送测试邮件」与**注册/重置邮箱验证码**统一走 SMTP
   （支持 SSL(465) / STARTTLS(587) / 明文(25)，AUTH LOGIN）。**未填 SMTP 服务器时回退 PHP mail()**（需主机 MTA）。
   SMTP 密码接口掩码回显（`******`），保存时留空或保持掩码即沿用旧值。

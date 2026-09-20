@@ -122,6 +122,20 @@ class AuthController
             // 假版本号比空值更坏：它会让页脚与更新检查同时说谎。
             // 品牌前缀/名称/官网链接由前端写死（frontend/src/components/PoweredBy.jsx），服务端不下发。
             'version' => (string) wstat_config('version'),
+            // 界面外观（公开不敏感：品牌图与菜单开关本就体现在公开渲染的页面上）。
+            // logo/icon 存的是 data/brand/ 下的文件名（空=未设置，前端用内置默认），
+            // 文件内容经 /brand/logo /brand/icon 公开下发 —— 文件名本身即可用作缓存版本号。
+            // hidden_menus：被管理员关闭的菜单（登录后侧栏隐藏 + 直连 404，见 Layout 守卫）。
+            // name：系统名称（空=前端用内置文案）；用于侧栏 / 登录注册页 / 浏览器标签页标题。
+            // keywords/description：管理员设置的 SEO 文案，前端注入 <meta>；空=不输出。
+            'ui' => [
+                'logo'         => Settings::get('brand_logo'),
+                'icon'         => Settings::get('brand_icon'),
+                'name'         => Settings::get('brand_name'),
+                'keywords'     => Settings::get('meta_keywords'),
+                'description'  => Settings::get('meta_description'),
+                'hidden_menus' => Settings::hiddenMenus(),
+            ],
         ]);
     }
 

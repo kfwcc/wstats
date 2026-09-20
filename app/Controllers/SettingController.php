@@ -9,6 +9,7 @@
  * GET   /api/settings/version  当前版本 + 远端在线更新检查
  * POST  /api/settings/update   一键升级到最新版本（下载地址由服务端决定，不接受客户端入参）
  * GET   /api/settings/ip-check 真实 IP 采集自检（列出各候选来源的实际取值，供管理员手动指定来源）
+ * POST  /api/settings/brand    上传 / 复位品牌图（multipart：logo / icon 文件；或 reset=logo|icon）
  */
 declare(strict_types=1);
 
@@ -144,9 +145,24 @@ class SettingController
 
         $kv = [];
         // 开关：仅接受 0/1
-        foreach (['registration_enabled', 'collect_enabled', 'alert_enabled', 'bot_filter_enabled', 'email_verify_enabled'] as $k) {
+        foreach (['registration_enabled', 'collect_enabled', 'alert_enabled', 'bot_filter_enabled', 'email_verify_enabled', 'spider_enabled'] as $k) {
             if ($req->input($k) !== null) {
                 $kv[$k] = (int) (bool) $req->input($k);
+            }
+        }
+        // 事件明细保留天数：空串 = 跟随 config.php 的 collect.event_retention；
+        // 非空必须是 1-3650 的整数（cron clean 直接拿去算分区删除边界）。
+        // 注意：本键此前只在白名单里、没有写入分支 —— 前端发了、服务端静默丢掉，
+        // 表现为「改完点保存提示成功、刷新又变回去」。新增/删除键时务必同步这里。
+        if ($req->input('retention_days') !== null) {
+            $rd = trim((string) $req->input('retention_days'));
+            if ($rd !== '') {
+                if (!preg_match('/^\d+$/', $rd) || (int) $rd < 1 || (int) $rd > 3650) {
+                    wstat_err('事件明细保留天数需为 1-3650 的整数（留空表示跟随配置文件）', 422);
+                }
+                $kv['retention_days'] = (string) (int) $rd;
+            } else {
+                $kv['retention_days'] = '';
             }
         }
         // SMTP 文本项
@@ -235,6 +251,41 @@ class SettingController
             $kv['ip_source_header'] = $hdr;
         }
 
+        // 被关闭的菜单：逗号分隔的路由 key（如 /spiders,/heatmap）；空串=全部显示。
+        // 每个 token 必须形如 /xxx（小写字母数字连字符），非法 token 直接 422 整批不落库。
+        // 注意：brand_logo / brand_icon 刻意**没有** PATCH 分支 —— 品牌图只能走
+        // /api/settings/brand（上传时同步落文件），不能凭空写一个不存在的文件名。
+        if ($req->input('hidden_menus') !== null) {
+            $raw = trim((string) $req->input('hidden_menus'));
+            if ($raw !== '') {
+                foreach (explode(',', $raw) as $k) {
+                    if (preg_match('#^/[a-z0-9-]+$#', trim($k)) !== 1) {
+                        wstat_err('菜单 key 格式不正确：' . trim($k), 422);
+                    }
+                }
+                $kv['hidden_menus'] = implode(',', array_values(array_filter(array_map('trim', explode(',', $raw)))));
+            } else {
+                $kv['hidden_menus'] = '';
+            }
+        }
+
+        // 系统名称 / meta 关键词 / meta 简介：纯文本，trim 后限长（超长 422 整批不落库）。
+        // 空串=恢复默认（前端回落内置文案 / 不输出 meta）。随 /api/auth/public 的 ui 段公开下发。
+        $textLimits = [
+            'brand_name'       => Settings::BRAND_NAME_MAX,
+            'meta_keywords'    => Settings::META_KEYWORDS_MAX,
+            'meta_description' => Settings::META_DESCRIPTION_MAX,
+        ];
+        foreach ($textLimits as $k => $max) {
+            if ($req->input($k) !== null) {
+                $v = trim((string) $req->input($k));
+                if (mb_strlen($v) > $max) {
+                    wstat_err('内容超过长度上限（' . $max . ' 字符）：' . $k, 422);
+                }
+                $kv[$k] = $v;
+            }
+        }
+
         if (!$kv) {
             wstat_err('没有需要保存的设置', 422);
         }
@@ -299,6 +350,108 @@ class SettingController
             wstat_err('升级失败：' . $e->getMessage(), 500);
         }
         wstat_json($r);
+    }
+
+    /**
+     * POST /api/settings/brand —— 上传 / 复位品牌图（Logo 与 Favicon）。
+     *
+     * multipart 字段二选一（也可同请求都带）：
+     *   logo  面板 Logo（≤1MB，png/jpg/jpeg/svg/ico/webp）
+     *   icon  浏览器标签页图标（≤256KB，同格式）
+     * 或表单字段 reset=logo|icon（可逗号分隔多个）表示恢复内置默认。
+     *
+     * 存储：data/brand/<kind>.<ext>（同 kind 换扩展名时删除旧文件）；
+     * 设置里只记文件名 —— 文件名本身即缓存版本号（变化 → 前端 URL 变化 → 浏览器缓存失效）。
+     * 校验扩展名 + finfo MIME 双重确认，避免「把 PHP/HTML 改名上传」被当作图片下发。
+     */
+    public function brand(Request $req): void
+    {
+        Settings::requireAdmin($req);
+        $dir = Settings::brandDir();
+        $done = [];
+
+        // ---- 复位：删除文件 + 清空设置 ----
+        $reset = trim((string) ($req->input('reset') ?? ''));
+        if ($reset !== '') {
+            foreach (explode(',', $reset) as $kindRaw) {
+                $kind = trim(strtolower($kindRaw));
+                if (!in_array($kind, ['logo', 'icon'], true)) {
+                    continue;
+                }
+                $old = basename(trim(Settings::get('brand_' . $kind)));
+                if ($old !== '' && is_file($dir . '/' . $old)) {
+                    @unlink($dir . '/' . $old);
+                }
+                Settings::set(['brand_' . $kind => '']);
+                $done[$kind] = '';
+            }
+        }
+
+        // ---- 上传 ----
+        foreach (['logo' => Settings::BRAND_LOGO_MAX, 'icon' => Settings::BRAND_ICON_MAX] as $kind => $maxBytes) {
+            $f = $_FILES[$kind] ?? null;
+            if (!is_array($f) || ($f['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) {
+                continue;
+            }
+            if (($f['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+                wstat_err('上传失败（错误码 ' . (string) ($f['error'] ?? -1) . '），请重试', 422);
+            }
+            $size = (int) ($f['size'] ?? 0);
+            if ($size <= 0 || $size > $maxBytes) {
+                wstat_err($kind === 'logo'
+                    ? 'Logo 需为 ≤1MB 的图片文件'
+                    : 'Icon 需为 ≤256KB 的图片文件', 422);
+            }
+            $ext = strtolower(pathinfo((string) ($f['name'] ?? ''), PATHINFO_EXTENSION));
+            if (!in_array($ext, Settings::BRAND_EXTS, true)) {
+                wstat_err('仅支持 ' . implode(' / ', Settings::BRAND_EXTS) . ' 格式', 422);
+            }
+            // MIME 实测：扩展名可以骗，真实字节骗不了
+            $mime = '';
+            if (function_exists('finfo_open')) {
+                $fi = finfo_open(FILEINFO_MIME_TYPE);
+                if ($fi) {
+                    $mime = (string) finfo_file($fi, (string) $f['tmp_name']);
+                    finfo_close($fi);
+                }
+            }
+            $allow = [
+                'png' => ['image/png'], 'jpg' => ['image/jpeg'], 'jpeg' => ['image/jpeg'],
+                'svg' => ['image/svg+xml', 'text/plain', 'text/xml', 'application/xml'],
+                'ico' => ['image/x-icon', 'image/vnd.microsoft.icon', 'image/png'],
+                'webp' => ['image/webp'],
+            ];
+            if ($mime !== '' && !in_array($mime, $allow[$ext] ?? [], true)) {
+                wstat_err('文件内容与扩展名不符（检测到 ' . $mime . '）', 422);
+            }
+            // 同 kind 换扩展名时清掉旧文件（设置里只记一个文件名）
+            $old = basename(trim(Settings::get('brand_' . $kind)));
+            $name = $kind . '.' . $ext;
+            // move_uploaded_file 校验 is_uploaded_file，CLI 自测夹具（伪造 $_FILES）下必然失败，
+            // 因此补 copy 兜底 —— 正常 Web 路径仍走 move_uploaded_file，语义不变。
+            $moved = @move_uploaded_file((string) $f['tmp_name'], $dir . '/' . $name);
+            if (!$moved) {
+                $moved = @copy((string) $f['tmp_name'], $dir . '/' . $name);
+            }
+            if (!$moved) {
+                wstat_err('保存文件失败（检查 data/brand/ 目录写权限）', 500);
+            }
+            @chmod($dir . '/' . $name, 0644);
+            if ($old !== '' && $old !== $name && is_file($dir . '/' . $old)) {
+                @unlink($dir . '/' . $old);
+            }
+            Settings::set(['brand_' . $kind => $name]);
+            $done[$kind] = $name;
+        }
+
+        if (!$done) {
+            wstat_err('没有可处理的品牌图（multipart 字段 logo / icon，或 reset=logo|icon）', 422);
+        }
+        wstat_json([
+            'saved' => array_keys($done),
+            'logo'  => Settings::get('brand_logo'),
+            'icon'  => Settings::get('brand_icon'),
+        ]);
     }
 
     /** POST /api/settings/email-test */

@@ -9,6 +9,7 @@ require dirname(__DIR__) . '/app/bootstrap.php';
 
 use Wstat\Support\RedisClient;
 use Wstat\Support\Referrer;
+use Wstat\Support\Spider;
 use Wstat\Support\UaParser;
 use Wstat\Support\Sessionizer;
 use Wstat\Support\Util;
@@ -185,6 +186,96 @@ check('buildRow null', \Wstat\Support\Sessionizer::buildRow($hash2) === null, '�
 $single = $hash; $single['pv'] = '1';
 $r1 = \Wstat\Support\Sessionizer::buildRow($single);
 check('bounce single', (int) ($r1['bounce'] ?? 0) === 1, 'pv=1 跳出');
+/* ============ 6. Spider（爬虫识别与归一化，纯函数） ============ */
+echo "\n[6] Spider\n";
+$d = Spider::detect('curl/8.0.1');
+check('detect curl', $d['bot'] === true && $d['name'] === 'curl' && $d['kind'] === 'tool', json_encode($d));
+$d = Spider::detect('Mozilla/5.0 (compatible; Baiduspider/2.0; +http://www.baidu.com/search/spider.html)');
+check('detect baidu', $d['bot'] === true && $d['name'] === 'Baiduspider' && $d['kind'] === 'search');
+// 规则表顺序敏感：图片抓取器的片段必须在主 UA 之前命中，且归到同一产品名（否则会被拆成两只爬虫）
+$d = Spider::detect('Mozilla/5.0 (compatible; Baiduspider-image/1.0; +http://www.baidu.com/search/spider.html)');
+check('detect 顺序敏感（image → 同一产品名）', $d['name'] === 'Baiduspider', json_encode($d));
+$d = Spider::detect('Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.1; +https://openai.com/gptbot)');
+check('detect GPTBot 归 AI 类', $d['name'] === 'GPTBot' && $d['kind'] === 'ai', json_encode($d));
+
+// 真实访客 UA：一律不得计入蜘蛛（这是「爬虫过滤」不误伤访客的前提）
+$visitorUas = [
+    '',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36 MicroMessenger/8.0.44',
+];
+$bad = [];
+foreach ($visitorUas as $i => $visitorUa) {
+    $d = Spider::detect($visitorUa);
+    if ($d['bot'] !== false || $d['name'] !== '' || $d['kind'] !== '') {
+        $bad[] = '#' . $i;
+    }
+}
+check('真实访客 UA 一律不记账', $bad === [], implode(',', $bad));
+
+// 规则表未覆盖但确实是 bot → 兜底命名，绝不因为「不认识」而丢数据
+$d = Spider::detect('foobar/1.0');
+check(
+    '未覆盖的 bot 兜底为「其它爬虫」',
+    $d['bot'] === true && $d['name'] === Spider::FALLBACK_NAME && $d['fallback'] === true,
+    json_encode($d)
+);
+
+// **核心不变量**：detect() 的 bot 判定必须与采集端过滤所用的 UaParser::isBot() 完全一致。
+// 若将来有人在规则表里塞宽泛片段（'ecosia' / 'yahoo.' 之类）并让 Spider 自己判定「是不是爬虫」，
+// 就会把真实访客算成爬虫 —— 开着「爬虫过滤」时那是**直接丢访客数据**。
+$probeUas = array_merge($visitorUas, [
+    'curl/8.0.1',
+    'python-requests/2.31.0',
+    'Go-http-client/1.1',
+    'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+    'Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)',
+    'Mozilla/5.0 (compatible; EcosiaBot/1.0)',
+    'Mozilla/5.0 (compatible; Yahoo! Slurp; http://help.yahoo.com/help/us/ysearch/slurp)',
+    'Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)',
+    'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+]);
+$mismatch = [];
+foreach ($probeUas as $probeUa) {
+    if (Spider::detect($probeUa)['bot'] !== UaParser::isBot($probeUa)) {
+        $mismatch[] = ($probeUa === '' ? '(空 UA)' : $probeUa);
+    }
+}
+check('bot 判定与 UaParser::isBot 完全一致', $mismatch === [], implode(' | ', $mismatch));
+
+// 名称 → 类别反查（报表按已落库的名称还原类别，必须与写入时一致）
+check(
+    'kindOfName 反查',
+    Spider::kindOfName('Baiduspider') === Spider::KIND_SEARCH
+    && Spider::kindOfName(Spider::FALLBACK_NAME) === Spider::KIND_OTHER
+    && Spider::kindOfName('不存在的爬虫') === Spider::KIND_OTHER
+);
+
+// 规则表卫生：类别必须是已知常量（防手滑写出 'serach' —— 前端会拿不到标签、报表归类为空）
+// 注意 RULES 是 private **const**（不是属性），要用 ReflectionClassConstant 才能取到。
+try {
+    $rc = new ReflectionClassConstant(Spider::class, 'RULES');
+    $rules = (array) $rc->getValue();
+    $known = array_keys(Spider::KIND_LABELS);
+    $badKind = [];
+    $emptyName = [];
+    foreach ($rules as $needle => [$nm, $kd]) {
+        if (!in_array($kd, $known, true)) {
+            $badKind[] = $needle . '=>' . $kd;
+        }
+        if ($nm === '') {
+            $emptyName[] = (string) $needle;
+        }
+    }
+    check('规则表类别均为已知常量', $badKind === [], implode(',', $badKind));
+    check('规则表名称为空？', $emptyName === [], implode(',', $emptyName));
+    check('规则表规模', count($rules) >= 80, '当前 ' . count($rules) . ' 条');
+} catch (Throwable $e) {
+    check('规则表可反射读取', false, $e->getMessage());
+}
+
 /* ============ 汇总 ============ */
 echo "\n==============================\n";
 echo "RESULT: $pass passed, $fail failed\n";

@@ -4,6 +4,7 @@
 
 > 当前交付：概览看板（PV/UV/IP/跳出率/平均时长/活跃趋势/今日实时分时）、**来源分析**（渠道构成/趋势/外链/UTM 系列/广告平台）、
 > 会话列表 + 单会话完整行为日志、注册登录、多站点管理 + 两步文件验证、SDK 安装引导（**已验证站点不可修改，仅验证后可用 SDK**）。
+> 其余 12 个深度模块（访客/旅程/广告/性能/回放/热力/漏斗/地域/大屏…）已按计划在采集层与库表预留全量字段，逐期迭代交付。
 
 ---
 
@@ -58,6 +59,7 @@
 ├── scripts/                  # worker.php（常驻消费）· cron.php（定时）· doctor.php / geo-doctor.php（诊断）
 │                             # · selfcheck.php（离线自检）· fetch-geo.php（更新 IP 库）
 ├── data/                     # 运行期数据：installed.php / install.lock / ip2region.xdb + ip2region_v6.xdb / verify/ / backup/
+├── sql/                      # install.sql（幂等全量建表）+ upgrade-*.sql（增量升级）
 ├── deploy/                   # Nginx / Apache 配置样例
 ├── docs/deploy.md            # 部署与运维手册（含排查速查表）
 └── README.md  RELEASE.md  CHANGELOG.md
@@ -65,6 +67,10 @@
 
 `app/ scripts/ data/ sql/ config.php` 全在 Web 根之外 → **天然不可直访，无需任何屏蔽规则**，
 `data/installed.php`（含库 / Redis 凭据）也不可能被下载。
+
+> 源码仓库比发布包多出：`server/`（后端源码，打包时平铺到包根）、`install/`（安装器源码 → `public/install`）、
+> `frontend/`（React 源码）、`dev/`（自测与探针脚本，不进包）、`scripts/build-release.php`（构建脚本）、
+> `update-server/`（在线更新服务端）、`sql/schema.sql`、`sql/wstat.sql`、`docs/architecture.md`（以上三项仅源码仓库保留）。
 
 > 完整部署手册见 [`docs/deploy.md`](docs/deploy.md)。
 
@@ -118,7 +124,17 @@ nohup php scripts/worker.php >> data/worker.log 2>&1 &   # 常驻，建议 super
 > ⚠️ 没有 worker：`events` 明细不入库、会话/停留时长/实时数据永远为空。
 > ⚠️ 更新代码后必须**重启 worker**（PHP 常驻进程不会热加载）；请从项目根目录启动，避免误加载其它副本的旧代码。
 
-### 3.4 Nginx 站点配置（管理端）
+### 3.4 自行构建前端（仅在改动前端源码时需要）
+
+```bash
+cd frontend
+npm install
+npm run build                       # 产物 dist/
+php ../scripts/build-release.php --zip   # 重新出包（dist 会自动复制到 public/）
+# 本地联调时同步到 PHP 静态目录：php dev/sync-dist.php（会先清掉旧 assets）
+```
+
+### 3.5 Nginx 站点配置（管理端）
 
 完整样例见 [`deploy/nginx.conf.sample`](deploy/nginx.conf.sample)（Apache 用户见 `deploy/apache.htaccess.sample`）：
 
@@ -146,6 +162,13 @@ location /sdk/ { try_files $uri =404; }            # SDK 静态直出
 > 依次执行 `php scripts/cron.php session rollup` → 刷新概览；仍无则用 doctor 的 `[4b] 数据链路快照`
 > 核对：events 的 `site_id` 与所选站点一致？`day`（站点本地日 YYYY-MM-DD）在所选区间？`type='pageview'`？
 > PV 正常但 visits/跳出率/时长为 0 → sessions 表为空，需 worker 常驻 + cron session 回收（Redis 可用时会话先驻留 Redis）。
+
+### 3.6 本地联调（源码仓库）
+```bash
+php -S 127.0.0.1:8080 -t server/public server/router.php   # 后端（开发副本在 server/ 下）
+cd frontend && npm run dev                                  # 前端 5173（已配 /api 代理）
+```
+浏览器打开 `http://localhost:5173` → 注册账号 → 添加站点 → 复制安装代码（在 `data-host` 指到本系统）→ 打开被统计站点即可看到数据。
 
 ## 4. 使用流程（一次闭环）
 1. 注册/登录 → 2. 「站点管理」添加站点（域名仅主机名）→ 3. 文件验证：**两步** —— 打开验证弹窗自动生成 `wstat_verify_{token}.txt`（令牌落库）→ 将该文件放到站点根目录（内容为 token）→ 点击「我已上传，立即校验」（统计服务器回源拉取比对，通过后状态变绿）→ 4. **验证通过后 SDK 按钮才可用**，复制安装代码到目标站 `<head>` → 5. 「概览看板」看总量与趋势，「来源分析」看渠道构成/外链/UTM/广告，「会话列表」查看每次访问与逐条行为日志。
@@ -179,3 +202,25 @@ location /sdk/ { try_files $uri =404; }            # SDK 静态直出
 
 响应统一 `{code,msg,data}`；认证 `Authorization: Bearer {token}`。
 
+## 6. 已知限制 / 演进
+- 概览走 `site_daily` 预聚合快路径（缺失天自动回填预热），但 **UV/IP 一律由 `events` 明细精确去重**（`StatsController::exactUniq` / `todayExact`），跨天合并也在 SQL 内完成；Redis 是否部署都不影响该口径，概览 / IP 地域页 / 大屏 / 开放接口数字完全一致。
+- 来源分析当前按 PV 计数；渠道级 UV 去重因成本暂未提供（后续按需加入）。
+- 事件归因列（utm_source/utm_medium/click_source/ref_host）为增量字段：已有部署需执行 `sql/upgrade-2026-09-09-sources.sql` 后重启 worker/collect；未迁移期间写入自动过滤这些列，不会中断。
+- 会话“新访客”判定基于 Redis 90 天窗口，Redis 重置后首次会误判（影响极小）。
+- IP 地域默认走**本地离线库**（`geo_driver: xdb`），**IPv4 / IPv6 各一份、互相独立降级**：
+  `data/ip2region.xdb`（IPv4，约 11MB，`collect.geo_xdb`）/ `data/ip2region_v6.xdb`（IPv6，约 36MB，
+  `collect.geo_xdb6`），均随包附带；也可切 `http` 自备接口或 `none` 关闭解析，通过 `config.php` /
+  `WSTAT_GEO_*` 配置。缺 v6 库时只有 IPv6 访客无地域（IPv4 不受影响），跑 `php scripts/fetch-geo.php` 补齐。
+- **访客真实 IP 的取值来源为手动指定**（`Support\Util::ipTrace()`，程序不做任何自动判断）：可选
+  `remote_addr`（默认，TCP 对端地址、客户端不可伪造）/ `x_real_ip` / `x_forwarded_for` /
+  `custom`（配 `ip_source_header`，如 `CF-Connecting-IP`）。一律取所选头**最右侧**的合法 IP
+  （CDN / Nginx 都把真值追加到末尾，取最左等于采信客户端伪造值）；头缺失或值非法时回落 `REMOTE_ADDR`，
+  **绝不写出空 IP**。配置项 `collect.ip_source` / `ip_source_header`（环境变量 `WSTAT_IP_SOURCE` /
+  `WSTAT_IP_HEADER`），面板「系统设置 → 真实 IP 采集」保存的值优先；面板同时提供候选来源实测表，
+  哪一行显示出你的真实地址就选哪一行。
+- 会话回放当前可还原事件时序（浏览/点击/滚动），像素级 DOM 回放建议二期接 rrweb。
+- 登录限流依赖 Redis；Redis 不可用时放行（可结合 Nginx limit_req 兜底）。
+
+## 7. 验证
+- `php scripts/selfcheck.php` —— RESP 协议/UA/来源分类/工具 31 项离线自检，100% 通过。
+- 全量 PHP `php -l` 语法零错误；前端 `npm run build` 构建通过。

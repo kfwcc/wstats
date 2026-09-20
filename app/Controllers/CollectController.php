@@ -25,6 +25,8 @@ use Wstat\Support\SearchEngine;
 use Wstat\Support\Sessionizer;
 use Wstat\Support\Settings;
 use Wstat\Support\SiteStore;
+use Wstat\Support\Spider;
+use Wstat\Support\SpiderLog;
 use Wstat\Support\UaParser;
 use Wstat\Support\Util;
 
@@ -33,6 +35,7 @@ class CollectController
     private const TYPES = ['pageview', 'event', 'perf', 'click', 'scroll', 'hb', 'outlink', 'download', 'search'];
     private const MAX_QUEUE = 200000;               // 队列积压保护
     private const RATE_PER_MIN = 300;               // 同站点同 IP 每分钟上报上限（正常页面远低于此值）
+    private const SPIDER_RATE_PER_MIN = 300;        // 同站点同 IP 每分钟**蜘蛛记账**上限（独立桶，见 handle()）
     private const MAX_PAYLOAD = 8192;               // 事件附加数据 JSON 上限（字节）
 
     /** 入口 */
@@ -102,9 +105,32 @@ class CollectController
         $uaRaw = (string) ($_SERVER['HTTP_USER_AGENT'] ?? '');
         $uaRow = UaParser::parse($uaRaw);
 
+        // ---- 蜘蛛统计（与下面的过滤**互相独立**）：识别为爬虫就先记一笔蜘蛛账。
+        // 覆盖面说明：服务端接入（/spider.php）负责「不执行 JS 的爬虫」（绝大多数），
+        // 这里负责「爬虫恰好也执行了 JS」的兜底（Googlebot / 移动版 Baiduspider 常见），
+        // 站长零接入也能看到一部分数据。爬虫数据只落 spider_hits，**不参与任何访客指标**，
+        // 所以「记账」与「过滤开关」是两件事、互不影响。
+        // 写库前过一道按 (站点,IP) 的限流桶：爬虫从少量 IP 高频抓取，避免把写库打成主要开销。
+        $spiderInfo = Spider::detect($uaRaw);
+        if ($spiderInfo['bot']) {
+            $sLimit = filter_var(getenv('WSTAT_RATE_LIMIT') ?: self::SPIDER_RATE_PER_MIN, FILTER_VALIDATE_INT);
+            if ($sLimit === false
+                || RateLimiter::allow('spider:' . $sid . ':' . ($ip !== '' ? $ip : 'unknown'), $sLimit)) {
+                SpiderLog::hit(
+                    $sid,
+                    Util::localDay($now, $tzMin !== 0 ? $tzMin : (int) round(Util::tzOffsetSec((string) $site['timezone']) / 60)),
+                    $spiderInfo['name'],
+                    SpiderLog::cleanUrl($url),
+                    0,
+                    0,
+                    $now
+                );
+            }
+        }
+
         // ---- 爬虫过滤（系统设置可关）：命中爬虫/HTTP 客户端 UA 静默丢弃。
         // 返回 200 而非 403 —— 大多数爬虫会对 4xx 重试，静默丢弃可避免刷日志与放大流量。
-        if (Settings::int('bot_filter_enabled') && UaParser::isBot($uaRaw)) {
+        if (Settings::int('bot_filter_enabled') && $spiderInfo['bot']) {
             $this->tiny();
             return;
         }
@@ -275,44 +301,50 @@ class CollectController
             if ($hasEndUser === null) {
                 $hasEndUser = array_key_exists('end_user', Db::tableColumns('sessions'));
             }
-            // 占位符严格按列顺序：site_id,session_id,visitor_id[,end_user],start_ts,end_ts,
-            // entry_url,exit_url,source,medium,campaign,content,term,click_id,
-            // browser,os,device,screen,lang,ip,country,province,city,created_at；
-            // pageviews=1 / duration=0 / bounce=1 / is_new=0 为字面常量
-            $sql = $hasEndUser
-                ? 'INSERT INTO sessions
-                   (site_id,session_id,visitor_id,end_user,start_ts,end_ts,pageviews,duration,bounce,is_new,
-                    entry_url,exit_url,source,medium,campaign,content,term,click_id,
-                    browser,os,device,screen,lang,ip,country,province,city,created_at)
-                   VALUES (?,?,?,?,?,?,?,1,0,1,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON DUPLICATE KEY UPDATE
-                     pageviews=pageviews+1,
-                     end_ts=VALUES(end_ts),
-                     duration=VALUES(end_ts)-start_ts,
-                     bounce=0,
-                     exit_url=VALUES(exit_url)'
-                : 'INSERT INTO sessions
-                   (site_id,session_id,visitor_id,start_ts,end_ts,pageviews,duration,bounce,is_new,
-                    entry_url,exit_url,source,medium,campaign,content,term,click_id,
-                    browser,os,device,screen,lang,ip,country,province,city,created_at)
-                   VALUES (?,?,?,?,?,1,0,1,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON DUPLICATE KEY UPDATE
+            // 列与值**全部占位符绑定**（不写字面量常量）：一旦列数/顺序与参数不一致，
+            // 下方自检立刻拦下。历史事故：字面量 1,0,1,0 夹在占位符序列中间时多写了一个
+            // `?`，整段值右移一位 —— pageviews 绑定到 URL 字符串（→0）、entry_url 绑到字面量
+            // 0（→入口页显示 “0”）、duration/bounce/is_new 全错，且占位符数与参数数「同时
+            // 多一个」使旧自检形同虚设。
+            // 顺序：site_id,session_id,visitor_id[,end_user],start_ts,end_ts,
+            //      pageviews,duration,bounce,is_new,entry_url,exit_url,
+            //      source,medium,campaign,content,term,click_id,
+            //      browser,os,device,screen,lang,ip,country,province,city,created_at
+            $dup = ' ON DUPLICATE KEY UPDATE
                      pageviews=pageviews+1,
                      end_ts=VALUES(end_ts),
                      duration=VALUES(end_ts)-start_ts,
                      bounce=0,
                      exit_url=VALUES(exit_url)';
-            $args = $hasEndUser
-                ? [$evt['site_id'], $evt['session_id'], $evt['visitor_id'], $evt['end_user'], $now, $now,
-                   $evt['url'], $evt['url'],
-                   $evt['source'], $evt['medium'], $evt['campaign'], $evt['content'], $evt['term'], $evt['click_id'],
-                   $evt['browser'], $evt['os'], $evt['device'], $evt['screen'], $evt['lang'],
-                   $evt['ip'], $evt['country'], $evt['province'], $evt['city'], $now]
-                : [$evt['site_id'], $evt['session_id'], $evt['visitor_id'], $now, $now,
-                   $evt['url'], $evt['url'],
-                   $evt['source'], $evt['medium'], $evt['campaign'], $evt['content'], $evt['term'], $evt['click_id'],
-                   $evt['browser'], $evt['os'], $evt['device'], $evt['screen'], $evt['lang'],
-                   $evt['ip'], $evt['country'], $evt['province'], $evt['city'], $now];
+            if ($hasEndUser) {
+                $sql = 'INSERT INTO sessions
+                   (site_id,session_id,visitor_id,end_user,start_ts,end_ts,pageviews,duration,bounce,is_new,
+                    entry_url,exit_url,source,medium,campaign,content,term,click_id,
+                    browser,os,device,screen,lang,ip,country,province,city,created_at)
+                   VALUES (' . implode(',', array_fill(0, 28, '?')) . ')' . $dup;
+                $args = [
+                    $evt['site_id'], $evt['session_id'], $evt['visitor_id'], $evt['end_user'],
+                    $now, $now, 1, 0, 1, 0,
+                    $evt['url'], $evt['url'],
+                    $evt['source'], $evt['medium'], $evt['campaign'], $evt['content'], $evt['term'], $evt['click_id'],
+                    $evt['browser'], $evt['os'], $evt['device'], $evt['screen'], $evt['lang'],
+                    $evt['ip'], $evt['country'], $evt['province'], $evt['city'], $now,
+                ];
+            } else {
+                $sql = 'INSERT INTO sessions
+                   (site_id,session_id,visitor_id,start_ts,end_ts,pageviews,duration,bounce,is_new,
+                    entry_url,exit_url,source,medium,campaign,content,term,click_id,
+                    browser,os,device,screen,lang,ip,country,province,city,created_at)
+                   VALUES (' . implode(',', array_fill(0, 27, '?')) . ')' . $dup;
+                $args = [
+                    $evt['site_id'], $evt['session_id'], $evt['visitor_id'],
+                    $now, $now, 1, 0, 1, 0,
+                    $evt['url'], $evt['url'],
+                    $evt['source'], $evt['medium'], $evt['campaign'], $evt['content'], $evt['term'], $evt['click_id'],
+                    $evt['browser'], $evt['os'], $evt['device'], $evt['screen'], $evt['lang'],
+                    $evt['ip'], $evt['country'], $evt['province'], $evt['city'], $now,
+                ];
+            }
             // 自检：占位符数量必须与绑定参数一致（防再次错位）
             if (substr_count($sql, '?') !== count($args)) {
                 error_log('[wstat] degradedSession 占位符/参数数量不一致，跳过会话直写');

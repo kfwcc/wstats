@@ -48,6 +48,28 @@ class Db
         return $st->fetchAll();
     }
 
+    /**
+     * 判定是否为连接级故障（2006 server has gone away / 2013 lost connection 等）。
+     * 常驻进程（worker）遇到此类故障必须重建连接，否则静态单例里的死连接会让所有写入永久失败。
+     */
+    public static function isConnLost(\PDOException $e): bool
+    {
+        $driverCode = (int) ($e->errorInfo[1] ?? 0);
+        if ($driverCode === 2006 || $driverCode === 2013) {
+            return true;
+        }
+        $msg = $e->getMessage();
+        return stripos($msg, 'MySQL server has gone away') !== false
+            || stripos($msg, 'Lost connection') !== false
+            || stripos($msg, 'Error while sending') !== false;
+    }
+
+    /** 重置连接单例（下一次访问时重连）。供常驻进程在连接级故障后调用。 */
+    public static function reconnect(): void
+    {
+        self::$pdo = null;
+    }
+
     /** 查询单行 */
     public static function first(string $sql, array $params = []): ?array
     {
@@ -128,7 +150,6 @@ class Db
         $cols = array_keys($merged);
         $colSql = '`' . implode('`,`', $cols) . '`';
         $verb = $ignore ? 'INSERT IGNORE' : 'INSERT';
-        $pdo = self::pdo();
         $n = 0;
         foreach (array_chunk($rows, $chunk) as $batch) {
             $placeholders = [];
@@ -142,19 +163,29 @@ class Db
                 $placeholders[] = '(' . implode(',', $ph) . ')';
             }
             $sql = sprintf('%s INTO `%s` (%s) VALUES %s', $verb, $table, $colSql, implode(',', $placeholders));
-            try {
-                $st = $pdo->prepare($sql);
-                $st->execute($flat);
-                $n += $st->rowCount();
-            } catch (\PDOException $e) {
-                // 带上表名/行数/列数便于定位（事件批 100 行内嵌上下文）
-                throw new \PDOException(sprintf(
-                    '[Db::insertBatch:%s] rows=%d cols=%d | %s',
-                    $table,
-                    count($batch),
-                    count($cols),
-                    $e->getMessage()
-                ), (int) $e->getCode(), $e);
+            // 连接级故障（2006 gone away / 2013 lost connection）自动重连并重试一次：
+            // 常驻 worker 长 idle 被 wait_timeout 掐断 / DDL（导入、迁移）掐断后，死单例会让所有写入永久失败
+            $attempt = 0;
+            while (true) {
+                try {
+                    $st = self::pdo()->prepare($sql);
+                    $st->execute($flat);
+                    $n += $st->rowCount();
+                    break;
+                } catch (\PDOException $e) {
+                    if ($attempt++ === 0 && self::isConnLost($e)) {
+                        self::reconnect();
+                        continue;
+                    }
+                    // 带上表名/行数/列数便于定位（事件批 100 行内嵌上下文）
+                    throw new \PDOException(sprintf(
+                        '[Db::insertBatch:%s] rows=%d cols=%d | %s',
+                        $table,
+                        count($batch),
+                        count($cols),
+                        $e->getMessage()
+                    ), (int) $e->getCode(), $e);
+                }
             }
         }
         return $n;
