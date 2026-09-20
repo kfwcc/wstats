@@ -337,3 +337,16 @@ cd frontend && npm run dev                                  # 前端 5173（已�
 ## 7. 验证
 - `php scripts/selfcheck.php` —— RESP 协议/UA/来源分类/工具 31 项离线自检，100% 通过。
 - 全量 PHP `php -l` 语法零错误；前端 `npm run build` 构建通过。
+
+## 8. 许可证
+本项目采用 **MIT 许可证**（见 [`LICENSE`](LICENSE)），Copyright (c) 2026 kfwcc：
+
+- ✅ **可免费商用**：可用于个人或商业项目，可修改、可再分发、可闭源集成、可自行销售；
+- ✅ 无附加限制：不要求开源你的修改，不限制部署站点数量，无「禁止转售」类条款；
+- ⚠️ **唯一义务**：保留版权与许可声明 —— 再分发（含打包发布包、Docker 镜像、二次开发后对外交付）时，
+  必须保留 `LICENSE` 全文与 `THIRD-PARTY-NOTICES.md`，不得移除源码中的版权声明；
+- ⚠️ 软件按「现状」提供，无任何担保，作者不承担使用后果的责任。
+
+> 第三方组件（React / Semi Design / Apache ECharts / tslib / lodash / ip2region）均为宽松许可证，
+> 允许商用与再分发，各自的版权归属与保留要求见 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)。
+> `public/geo/*.json` 为地图数据，对外公开地图展示需另行遵守地图数据来源条款与审图号要求。
