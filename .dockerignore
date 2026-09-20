@@ -1,0 +1,10 @@
+.git
+.github
+.workbuddy
+docs
+deploy
+CHANGELOG.md
+RELEASE.md
+README.md
+data/installed.php
+*.log
