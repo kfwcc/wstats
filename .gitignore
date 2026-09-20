@@ -1,6 +1,13 @@
+# 环境与本地覆盖配置
 .env
 docker-compose.override.yml
+
+# 运行期数据与安装凭据（勿入库）
 data/installed.php
 data/install.lock
 data/*.log
 public/install/local.php
+
+# 本地工具目录一律不入库（保留 .github，工作流需要跟踪）
+.*/
+!.github/

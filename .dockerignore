@@ -1,10 +1,10 @@
-.git
-.github
-.workbuddy
+# 隐藏文件与目录一律不进镜像（含 .git/.github/.env 等本地文件）
+# 例外：data/.htaccess 是项目自带的防护文件，必须保留
+**/.*
+!data/.htaccess
+
 docs
 docker-compose.yml
-.env
-.env.example
 CHANGELOG.md
 RELEASE.md
 README.md
