@@ -61,6 +61,9 @@
 ├── data/                     # 运行期数据：installed.php / install.lock / ip2region.xdb + ip2region_v6.xdb / verify/ / backup/
 ├── sql/                      # install.sql（幂等全量建表）+ upgrade-*.sql（增量升级）
 ├── deploy/                   # Nginx / Apache 配置样例
+├── docker/                   # 容器入口脚本（entrypoint.sh：可选自动安装 / cron-loop.sh：容器内定时任务）
+├── Dockerfile                # 官方镜像（php:8.2-apache，Web 根 = public/）
+├── docker-compose.yml        # 一键起 db + redis + web + worker + cron（配 .env.example 使用）
 ├── docs/deploy.md            # 部署与运维手册（含排查速查表）
 └── README.md  RELEASE.md  CHANGELOG.md
 ```
@@ -86,7 +89,8 @@ chown -R www:www /www/wwwroot/webstats/data
 ```
 
 **环境要求**：PHP ≥ 7.4（推荐 8.1/8.2，扩展 `pdo_mysql`/`json`/`mbstring`；**无需 redis 扩展**）、
-MySQL ≥ 5.7、Redis（可选，缺失自动降级）、Node 18+（仅自行构建前端时需要）。
+MySQL ≥ 5.7、Redis（可选，缺失自动降级）、Node 18+（仅自行构建前端时需要）；
+容器部署另需 Docker ≥ 20.10 + Docker Compose v2（见 [3.6 Docker 部署](#36-docker--docker-compose-部署)）。
 
 ### 3.2 安装（Web 向导 / 命令行二选一）
 
@@ -163,7 +167,116 @@ location /sdk/ { try_files $uri =404; }            # SDK 静态直出
 > 核对：events 的 `site_id` 与所选站点一致？`day`（站点本地日 YYYY-MM-DD）在所选区间？`type='pageview'`？
 > PV 正常但 visits/跳出率/时长为 0 → sessions 表为空，需 worker 常驻 + cron session 回收（Redis 可用时会话先驻留 Redis）。
 
-### 3.6 本地联调（源码仓库）
+### 3.6 Docker / Docker Compose 部署
+
+官方镜像 **`ghcr.io/kfwcc/wstats`**（仓库打 tag 后由 GitHub Actions 自动构建发布，见 `.github/workflows/docker-publish.yml`），
+仓库根目录自带 `Dockerfile` 与 `docker-compose.yml` + `.env.example`。
+
+**镜像内布局**：`/var/www/html` = 包根，Web 根 = `/var/www/html/public`（与发布包完全一致，`app/ scripts/ data/ config.php` 在 Web 根之外）。
+镜像内置 Apache（已开 `mod_rewrite`/`mod_expires`，并放好 `public/.htaccess` ≈ `deploy/apache.htaccess.sample`）、
+PHP 8.2（`pdo_mysql`/`mbstring`/`gd`/`opcache`）；MySQL 与 Redis 为外部服务（compose 已带）。
+
+#### A. Compose 一键起（推荐）
+
+```bash
+cp .env.example .env            # 改 WSTAT_DB_PASS / MYSQL_ROOT_PASSWORD / 管理员账号与口令
+docker compose up -d --build    # 首次构建；若已拉取 ghcr 镜像可用 docker compose up -d --no-build
+docker compose logs -f web      # 出现「自动安装完成」即为就绪
+```
+
+访问 `http://<服务器IP>:8080`（端口由 `.env` 的 `HTTP_PORT` 控制），用 `WSTAT_ADMIN_EMAIL` / `WSTAT_ADMIN_PASS` 登录。
+
+服务构成（`docker compose ps`）：
+
+| 服务 | 作用 | 说明 |
+|---|---|---|
+| `web` | Apache + PHP | 管理端 + `/api/*` + `/collect.php`，首次启动负责自动安装 |
+| `worker` | `php scripts/worker.php` | **常驻事件消费**：不启动则 events 明细不入库、会话/实时数据永远为空 |
+| `cron` | `wstat-cron`（容器内循环） | 等价 3.3 的 crontab：session 每分钟 · rollup 每 5 分钟 · partition 03:00 · clean 04:00 |
+| `db` | MySQL 8 | 数据卷 `db-data`，端口不对宿主机暴露 |
+| `redis` | Redis 7 | 数据卷 `redis-data`，可整体去掉（见 `WSTAT_NO_REDIS`） |
+
+#### B. 已有 MySQL / Redis，只跑应用容器
+
+```bash
+docker network create wstats
+
+docker run -d --name wstats-web --restart unless-stopped --network wstats -p 8080:80 \
+  -e WSTAT_DB_HOST=10.0.0.5 -e WSTAT_DB_NAME=webstats \
+  -e WSTAT_DB_USER=webstats -e WSTAT_DB_PASS='你的密码' \
+  -e WSTAT_REDIS_HOST=10.0.0.6 \
+  -e WSTAT_AUTO_INSTALL=1 \
+  -e WSTAT_ADMIN_EMAIL=admin@example.com -e WSTAT_ADMIN_PASS='Admin@12345' \
+  -v wstat-data:/var/www/html/data \
+  ghcr.io/kfwcc/wstats:latest
+
+# worker / cron：同一镜像、同样的 WSTAT_* 环境变量与同一个 data 卷，仅命令不同
+docker run -d --name wstats-worker --restart unless-stopped --network wstats \
+  <同样的 -e 参数> -v wstat-data:/var/www/html/data \
+  ghcr.io/kfwcc/wstats:latest php scripts/worker.php
+```
+
+> `data` 卷必须在 web / worker / cron 之间共享：安装配置（`installed.php`）、站点验证文件、IP 库都在里面。
+
+#### 首次自动安装
+
+`WSTAT_AUTO_INSTALL=1` 且 `data/install.lock` 不存在时，容器入口脚本会先等 MySQL 就绪，再执行：
+
+```bash
+php public/install/cli.php --no-interactive --create-db --db-* --redis-* --admin-email --admin-pass
+```
+
+（建表脚本幂等，不会删已有数据），完成后写入 `data/installed.php` + 安装锁。
+安装失败时容器照常启动，可访问 `/install/` 用 Web 向导补装。
+**装完建议删掉安装目录**：`docker compose exec web rm -rf public/install`（升级镜像后会恢复，可再删一次）。
+
+#### 手动安装 / 运维命令（不想自动安装时先设 `WSTAT_AUTO_INSTALL=0`）
+
+```bash
+docker compose exec web php public/install/cli.php --check      # 环境自检
+docker compose exec web php public/install/cli.php --status     # 安装状态与布局
+docker compose exec web php public/install/cli.php --unlock     # 解除安装锁（重装/迁移）
+docker compose exec web php scripts/doctor.php                  # 采集链路诊断
+docker compose exec web php scripts/selfcheck.php               # 离线自检（31 项）
+docker compose exec web php scripts/cron.php rollup             # 手动刷新汇总
+```
+
+#### 环境变量（优先级高于 `data/installed.php`，见 3.2 末尾说明）
+
+| 变量 | 说明 | 默认 / 示例 |
+|---|---|---|
+| `WSTAT_DB_HOST` / `_PORT` / `_NAME` / `_USER` / `_PASS` | MySQL 连接 | compose 内 `db:3306` |
+| `WSTAT_REDIS_HOST` / `_PORT` / `_AUTH` / `_DB` | Redis 连接（用自带 RESP 客户端，无需扩展） | compose 内 `redis:6379` |
+| `WSTAT_NO_REDIS=1` | 关闭 Redis：采集直写 MySQL，统计走库聚合（可不部署 redis 服务） | `0` |
+| `WSTAT_INSTALL_DB_USER` / `_PASS` | 应用账号无建库权限时，用它执行建库 | 空（用 `WSTAT_DB_*`） |
+| `WSTAT_AUTO_INSTALL` | 首次启动自动安装 | compose 内 `1` |
+| `WSTAT_ADMIN_EMAIL` / `WSTAT_ADMIN_PASS` | 自动安装创建的管理员（密码 8-72 位） | `admin@example.com` / `Admin@12345` |
+| `WSTAT_ALLOW_REGISTER=1` | 安装后开放注册 | `0`（仅管理员建号） |
+| `WSTAT_TZ` | 时区（同时决定 cron 的 03:00 / 04:00 时刻） | `Asia/Shanghai` |
+| `WSTAT_IP_SOURCE` / `WSTAT_IP_HEADER` | 真实 IP 取值来源（前面套 Nginx/CDN 时用 `x_real_ip` 等，详见 6） | `remote_addr` |
+| `WSTAT_DB_MAXW` | 每秒最多批量写事件数 | `5000` |
+| `WSTAT_DEBUG` / `WSTAT_ALLOW_UNVERIFIED` / `WSTAT_UPDATE_OFF` | 调试 / 放开采集校验 / 关闭一键升级 | 关闭 |
+
+#### 数据、备份与升级
+
+```bash
+# 备份数据库（结构与数据）
+docker compose exec db sh -c 'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE"' > webstats-$(date +%F).sql
+
+# 源码方式升级 / 镜像方式升级（worker、cron 会一并重建 = 重启 worker，避免跑旧代码）
+git pull && docker compose up -d --build
+docker compose pull && docker compose up -d
+
+# 日志与状态
+docker compose logs -f worker cron
+docker compose ps
+```
+
+> ⚠️ `docker compose down` 只停容器、数据卷保留；`docker compose down -v` 会**连数据库一起清空**（统计数据全部丢失）。
+> ⚠️ 反代 / HTTPS：容器内 Apache 监听 80，前面套 Nginx 或 Caddy 即可；反代场景务必按 6 的说明设置
+> `WSTAT_IP_SOURCE`，否则访客 IP 会全变成反代地址。
+
+### 3.7 本地联调（源码仓库）
 ```bash
 php -S 127.0.0.1:8080 -t server/public server/router.php   # 后端（开发副本在 server/ 下）
 cd frontend && npm run dev                                  # 前端 5173（已配 /api 代理）

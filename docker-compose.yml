@@ -1,0 +1,127 @@
+# WebStats Docker Compose 部署样例
+#
+# 快速起步：
+#   cp .env.example .env          # 按需修改数据库口令、管理员账号
+#   docker compose up -d --build  # 首次构建镜像并启动（已有 ghcr 镜像时可用 --no-build + pull）
+#   打开 http://<服务器IP>:8080   # 首次启动会自动安装（WSTAT_AUTO_INSTALL=1）
+#
+# 服务构成：
+#   db      MySQL 8（数据卷 db-data）
+#   redis   Redis 7（数据卷 redis-data；不需要可设 WSTAT_NO_REDIS=1 并删掉本服务）
+#   web     Apache + PHP 8.2，监听容器 80（映射 ${HTTP_PORT}）
+#   worker  常驻事件消费进程（不启动则 events 明细不入库、会话/实时数据为空）
+#   cron    容器内定时任务（session / rollup / partition / clean）
+#
+# 升级：docker compose pull && docker compose up -d
+#       （worker/cron 会被重建 → 等价于重启 worker，避免跑旧代码）
+name: wstats
+
+# 三个 WebStats 服务共用同一镜像与基础环境变量
+x-wstat-image: &wstat-image
+  build: .
+  image: ghcr.io/kfwcc/wstats:${WSTAT_IMAGE_TAG:-latest}
+
+x-wstat-env: &wstat-env
+  WSTAT_TZ: ${WSTAT_TZ:-Asia/Shanghai}
+  WSTAT_DB_HOST: ${WSTAT_DB_HOST:-db}
+  WSTAT_DB_PORT: "3306"
+  WSTAT_DB_NAME: ${WSTAT_DB_NAME:-webstats}
+  WSTAT_DB_USER: ${WSTAT_DB_USER:-webstats}
+  WSTAT_DB_PASS: ${WSTAT_DB_PASS:-wstats_pwd}
+  WSTAT_REDIS_HOST: ${WSTAT_REDIS_HOST:-redis}
+  WSTAT_REDIS_PORT: "6379"
+  WSTAT_REDIS_DB: ${WSTAT_REDIS_DB:-0}
+  WSTAT_REDIS_AUTH: ${WSTAT_REDIS_AUTH:-}
+  WSTAT_NO_REDIS: ${WSTAT_NO_REDIS:-0}
+
+services:
+  db:
+    image: mysql:8.0
+    container_name: wstats-db
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --max-connections=500
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-wstats_root_pwd}
+      MYSQL_DATABASE: ${WSTAT_DB_NAME:-webstats}
+      MYSQL_USER: ${WSTAT_DB_USER:-webstats}
+      MYSQL_PASSWORD: ${WSTAT_DB_PASS:-wstats_pwd}
+      TZ: ${WSTAT_TZ:-Asia/Shanghai}
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: wstats-redis
+    # 需要密码时：把下面 command 换成
+    #   redis-server --appendonly yes --requirepass ${WSTAT_REDIS_AUTH}
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  web:
+    <<: *wstat-image
+    container_name: wstats-web
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      <<: *wstat-env
+      # 首次启动自动安装（跑 install/cli.php，写 data/installed.php + 安装锁）
+      WSTAT_AUTO_INSTALL: ${WSTAT_AUTO_INSTALL:-1}
+      WSTAT_ADMIN_EMAIL: ${WSTAT_ADMIN_EMAIL:-admin@example.com}
+      WSTAT_ADMIN_PASS: ${WSTAT_ADMIN_PASS:-Admin@12345}
+      WSTAT_ALLOW_REGISTER: ${WSTAT_ALLOW_REGISTER:-0}
+      # 应用账号无建库权限时，用它建库（一般无需设置）
+      WSTAT_INSTALL_DB_USER: ${WSTAT_INSTALL_DB_USER:-}
+      WSTAT_INSTALL_DB_PASS: ${WSTAT_INSTALL_DB_PASS:-}
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+    volumes:
+      - wstat-data:/var/www/html/data
+    restart: unless-stopped
+
+  worker:
+    <<: *wstat-image
+    container_name: wstats-worker
+    command: ["php", "scripts/worker.php"]
+    depends_on:
+      web:
+        condition: service_started
+    environment: *wstat-env
+    volumes:
+      - wstat-data:/var/www/html/data
+    restart: unless-stopped
+
+  cron:
+    <<: *wstat-image
+    container_name: wstats-cron
+    command: ["wstat-cron"]
+    depends_on:
+      web:
+        condition: service_started
+    environment: *wstat-env
+    volumes:
+      - wstat-data:/var/www/html/data
+    restart: unless-stopped
+
+volumes:
+  db-data:
+  redis-data:
+  wstat-data:

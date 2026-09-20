@@ -1,0 +1,6 @@
+.env
+docker-compose.override.yml
+data/installed.php
+data/install.lock
+data/*.log
+public/install/local.php

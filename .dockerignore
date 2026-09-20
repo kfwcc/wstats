@@ -2,9 +2,14 @@
 .github
 .workbuddy
 docs
-deploy
+docker-compose.yml
+.env
+.env.example
 CHANGELOG.md
 RELEASE.md
 README.md
 data/installed.php
+data/install.lock
+data/*.log
+public/install/local.php
 *.log

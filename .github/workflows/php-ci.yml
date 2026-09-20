@@ -28,3 +28,17 @@ jobs:
             php -l "$f" || ERR=1
           done < <(find app public scripts -name '*.php' -print0)
           exit $ERR
+
+  compose:
+    name: compose 与容器脚本校验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: docker-compose.yml 结构校验
+        run: docker compose config --quiet
+
+      - name: 容器入口脚本语法检查（sh）
+        run: |
+          sh -n docker/entrypoint.sh
+          sh -n docker/cron-loop.sh
