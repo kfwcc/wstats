@@ -11,11 +11,13 @@ ENV APACHE_DOCUMENT_ROOT=/var/www/html/public \
     TZ=Asia/Shanghai
 
 # 必需扩展 pdo_mysql / mbstring（安装器 envCheck 强制要求），另附常用的 gd（图形验证码）
+# mbstring 需要 libonig-dev（oniguruma），缺了会在 configure 阶段报
+# "Package requirements (oniguruma) were not found" 退出 1
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        libpng-dev libjpeg62-turbo-dev libfreetype6-dev tzdata; \
+        libpng-dev libjpeg62-turbo-dev libfreetype6-dev libonig-dev tzdata; \
     ln -snf /usr/share/zoneinfo/$TZ /etc/localtime; echo $TZ > /etc/timezone; \
     docker-php-ext-configure gd --with-freetype --with-jpeg; \
     docker-php-ext-install -j"$(nproc)" pdo_mysql mbstring gd; \
