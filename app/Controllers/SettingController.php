@@ -297,6 +297,9 @@ class SettingController
      * GET /api/settings/version —— 当前版本 + 远端更新检查。
      * 远端地址取 config.php 的 update_check_url（默认 https://wstats-update.kfw.cc/update.php，
      * 环境变量 WSTAT_UPDATE_URL 可覆盖）；拉取失败不影响本接口返回当前版本。
+     *
+     * 跨版本升级：`chain` 是从当前版本到最新版要依次应用的增量包（升序），
+     * 面板据此显示「将依次应用 N 个增量包（v1.0.13 → … → v1.0.16）」。
      */
     public function version(Request $req): void
     {
@@ -321,15 +324,24 @@ class SettingController
             'full_size'      => $r['full_size'],
             'php_ok'         => $r['php_ok'],
             'update_enabled' => $r['update_enabled'],
+            'upgrade_mode'   => $r['upgrade_mode'],
+            'chain'          => $r['chain'],
+            'chain_len'      => $r['chain_len'],
+            'chain_reason'   => $r['chain_reason'],
+            'min_auto_version' => $r['min_auto_version'],
             'backups'        => Updater::backups(),
         ]);
     }
 
     /**
-     * POST /api/settings/update —— 一键升级到最新版本。
+     * POST /api/settings/update —— 一键升级到最新版本（支持跨版本，内部按链依次应用）。
      *
-     * 安全：**不接受客户端传入的下载地址**，一律由服务端重新执行 check() 取回官方地址，
+     * 安全：**不接受客户端传入的下载地址**，一律由服务端重新执行 check() 取回官方升级链，
      * 否则面板就成了「可写任意文件的下载器」。升级前的备份、校验、回滚见 Support\Updater。
+     *
+     * 跨版本：响应里的 done=false 表示「单次请求时间预算用尽，还有剩余步骤」——
+     * 前端应当立刻再调一次本接口续跑，直到 done=true。链是按当前实际版本重算的，
+     * 所以重复调用、中断后重试都是安全的（幂等）。
      */
     public function applyUpdate(Request $req): void
     {
@@ -344,8 +356,12 @@ class SettingController
         if (!$chk['can_auto']) {
             wstat_err($chk['reason'], 422);
         }
+        $steps = (array) $chk['chain'];
+        if ($steps === []) {
+            wstat_err('更新服务未提供可用的升级步骤，请下载完整包手工升级', 422);
+        }
         try {
-            $r = Updater::apply($chk['update_url'], $chk['update_sha256']);
+            $r = Updater::applyChain($steps);
         } catch (\Throwable $e) {
             wstat_err('升级失败：' . $e->getMessage(), 500);
         }

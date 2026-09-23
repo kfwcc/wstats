@@ -11,6 +11,7 @@ namespace Wstat\Controllers;
 use Wstat\Http\Request;
 use Wstat\Support\Auth;
 use Wstat\Support\Db;
+use Wstat\Support\Filter;
 use Wstat\Support\IpLocator;
 use Wstat\Support\Rds;
 use Wstat\Support\Referrer;
@@ -32,6 +33,15 @@ class StatsController
         $sid = (int) $site['id'];
         $tz = (string) $site['timezone'];
         $offset = Util::tzOffsetSec($tz);
+
+        // ---- 全局过滤器（1.0.16）：一旦有条件，site_daily 快路径就不再适用 ----
+        // 它是「全站 × 天」的预聚合，没有任何维度可过滤；因此整体改走 events/sessions 明细，
+        // 且**绝不回写 site_daily**（把「移动端 PV」写进全站 PV 会污染所有没有过滤的视图）。
+        $filters = Filter::parse($req->input('f', ''));
+        if (Filter::active($filters)) {
+            $this->overviewFiltered($site, $start, $end, $tz, $offset, $filters);
+            return;
+        }
 
         // ---- 1) 预聚合快路径：site_daily（uk_site_day 索引） ----
         $rows = Db::select(
@@ -309,7 +319,19 @@ class StatsController
         $len = count($days);
         $pEnd = date('Y-m-d', strtotime($start . ' 00:00:00') - 86400);
         $pStart = date('Y-m-d', strtotime($pEnd . ' 00:00:00') - ($len - 1) * 86400);
-        $prev = $this->periodTotals($sid, $pStart, $pEnd, $tz);
+
+        // 「同时刻对齐」（1.0.16）：当前区间的末日就是站点本地今天时，上一期只截到**同一时刻**。
+        // 不对齐的话，拿「今天 00:00–15:00」去比「昨天全天 24h」，PV/UV 必然显示大幅下降 ——
+        // 那不是数据在跌，是对比基准多算了 9 个小时。整段都落在过去的区间不受影响。
+        $todayLocal = gmdate('Y-m-d', time() + $offset);
+        $cutTs = null;
+        if ($end === $todayLocal && $start <= $end) {
+            [$todayStartTs] = Util::dateRangeToTs($todayLocal, $todayLocal, $tz);
+            $elapsed = max(0, time() - $todayStartTs);            // 今天已过去的秒数
+            [, $pEndNext] = Util::dateRangeToTs($pEnd, $pEnd, $tz);
+            $cutTs = $pEndNext - 86400 + $elapsed;                // 上期末日零点 + 同一时刻偏移
+        }
+        $prev = $this->periodTotals($sid, $pStart, $pEnd, $tz, $cutTs);
         $deltaKeys = ['pv', 'uv', 'ipc', 'visits', 'bounce_rate', 'avg_duration', 'new_users', 'old_users'];
         $deltas = [];
         foreach ($deltaKeys as $k) {
@@ -330,52 +352,300 @@ class StatsController
             'range' => ['start' => $start, 'end' => $end],
             'totals' => $totals,
             'deltas' => $deltas,
+            // 对比基准区间：前端据此提示「对比的是哪一段」，避免用户把「同时刻对齐」误读成数据异常
+            'deltas_base' => [
+                'start'   => $pStart,
+                'end'     => $pEnd,
+                'cut_ts'  => $cutTs,
+                'aligned' => $cutTs !== null,
+            ],
             'trend' => $trend,
             'hourly' => $hourly,
             'live' => $live,
         ]);
     }
 
-    /** 等长区间汇总（环比用）：site_daily 优先，覆盖不全时退回 events/sessions 明细聚合 */
-    private function periodTotals(int $sid, string $start, string $end, string $tz): array
+    /**
+     * 带全局过滤器时的概览：完全走 events/sessions 明细聚合。
+     *
+     * 为什么另起一条路径而不是在快路径里插条件：
+     *   1. site_daily 只按 (site_id, day) 预聚合，没有任何维度可过滤；
+     *   2. 过滤结果**不能回写** site_daily —— 那是全站视图的数据源，写进去会污染无过滤的页面；
+     *   3. 口径必须与无过滤时一致：UV/IP 仍走 events 精确去重，会话指标仍走 sessions。
+     *
+     * 唯一**不受**过滤器影响的是 `live`（实时在线/今日）：它回答「此刻谁在站上」，
+     * 与「历史切片」是两个不同的问题，响应里也照实返回未过滤的实时数据。
+     */
+    /* ==================== 全局过滤器（1.0.16）共用入口 ==================== */
+
+    /**
+     * 解析请求里的过滤条件，并编译出 events / sessions 两套片段。
+     *
+     * 返回 `[$filters, $ev, $ss]`，其中片段形如
+     * `['and' => ' AND (...) AND (...)' | '', 'args' => [...], 'skipped' => [...]]`。
+     * **`and` 自带前导 ` AND `**，调用方直接拼在 WHERE 末尾、把 `args` 接到自己参数的**尾部**即可 ——
+     * 占位符与参数永远由 `Filter` 一处产出，调用方不得往序列中间插字面量（v1.0.13 事故的固化预防）。
+     *
+     * 注意：`Filter` 的条件用**裸列名**，所以拼进带别名/JOIN 的 SQL 时该列必须无歧义；
+     * 现有 JOIN 都只暴露 `session_id`/`site_id`，本文件的用法是安全的（详见各处注释）。
+     *
+     * ⚠️ 返回值是**按位置**解构的：只要 `events` 片段时写 `[$filters, $ev]`（对），
+     * 只要 `sessions` 片段时**必须跳过中间那个** `[$filters, , $ss]` ——
+     * 写成 `[$filters, $ss]` 会取到 events 片段，症状是 `Unknown column 'ref_host'`。
+     */
+    private function filterOf(Request $req): array
     {
-        $rows = Db::select(
-            'SELECT pv,visits,bounce,duration,new_users FROM site_daily
-             WHERE site_id=? AND `day` BETWEEN ? AND ?',
-            [$sid, $start, $end]
-        );
-        $pv = 0; $visits = 0; $bounce = 0; $dur = 0; $new = 0;
-        foreach ($rows as $r) {
-            $pv += (int) $r['pv'];
-            $visits += (int) $r['visits'];
-            $bounce += (int) $r['bounce'];
-            $dur += (int) $r['duration'];
-            $new += (int) $r['new_users'];
+        $filters = Filter::parse($req->input('f', ''));
+        return [$filters, $this->filterPart($filters, 'events'), $this->filterPart($filters, 'sessions')];
+    }
+
+    /** 单表片段。`active` 为 false 时 `and` 是空串，拼上去对 SQL 无影响。 */
+    private function filterPart(array $filters, string $table): array
+    {
+        $c = Filter::sql($filters, $table);
+        return [
+            'and'     => $c['sql'] === '' ? '' : ' AND ' . $c['sql'],
+            'args'    => $c['args'],
+            'skipped' => $c['skipped'],   // 必须带出去：withFilters() 靠它告诉用户「哪条条件在这张表上无效」
+            'active'  => $c['sql'] !== '',
+        ];
+    }
+
+    /**
+     * 把过滤信息并入响应体。**无有效条件时不加 `filters` 字段** ——
+     * 前端与自测正是靠「字段在不在」判断这次查询走的是快路径还是明细聚合。
+     *
+     * `$parts` 传本次查询**实际用到**的表片段（events-only 的端点只传 events），
+     * 否则 `skipped` 会把用不到的表的「不支持该维度」也算进来，误导用户。
+     */
+    private function withFilters(array $out, array $filters, array ...$parts): array
+    {
+        if (!Filter::active($filters)) {
+            return $out;
         }
-        $expected = (int) ((strtotime($end) - strtotime($start)) / 86400) + 1;
-        $partial = count($rows) < $expected;
+        $skipped = [];
+        foreach ($parts as $p) {
+            $skipped = array_merge($skipped, (array) ($p['skipped'] ?? []));
+        }
+        $out['filters'] = [
+            'list'    => $filters,
+            'label'   => Filter::label($filters),
+            'skipped' => array_values(array_unique($skipped)),
+        ];
+        return $out;
+    }
+
+    private function overviewFiltered(array $site, string $start, string $end, string $tz, int $offset, array $filters): void
+    {
+        $sid = (int) $site['id'];
+        [$startTs, $endTs] = Util::dateRangeToTs($start, $end, $tz);
+
+        $ev = Filter::sql($filters, 'events');
+        $ss = Filter::sql($filters, 'sessions');
+        $evAnd = $ev['sql'] === '' ? '' : ' AND ' . $ev['sql'];
+        $ssAnd = $ss['sql'] === '' ? '' : ' AND ' . $ss['sql'];
+
+        $daily = [];
+        foreach (Util::dailySeries($startTs, $endTs, $tz, fn () => null) as $d => $_) {
+            $daily[(string) $d] = ['day' => (string) $d, 'pv' => 0, 'uv' => 0, 'ipc' => 0,
+                'visits' => 0, 'bounce' => 0, 'duration' => 0, 'new_users' => 0];
+        }
+
+        // ---- 逐日 events：PV / UV / 独立 IP（各自 OVER 全集，不做日间相加）----
+        foreach (
+            Db::select(
+                "SELECT `day`, SUM(type='pageview') pv,
+                        COUNT(DISTINCT CASE WHEN type='pageview' THEN visitor_id END) uv,
+                        COUNT(DISTINCT CASE WHEN type='pageview' AND ip<>'' THEN ip END) ipc
+                 FROM events WHERE site_id=? AND `day` BETWEEN ? AND ?" . $evAnd . "
+                 GROUP BY `day`",
+                array_merge([$sid, $start, $end], $ev['args'])
+            ) as $r
+        ) {
+            $d = (string) $r['day'];
+            if (isset($daily[$d])) {
+                $daily[$d]['pv'] = (int) $r['pv'];
+                $daily[$d]['uv'] = (int) $r['uv'];
+                $daily[$d]['ipc'] = (int) $r['ipc'];
+            }
+        }
+
+        // ---- 逐日 sessions：会话数 / 跳出 / 时长 / 新客（本地日 = start_ts + offset）----
+        foreach (
+            Db::select(
+                "SELECT DATE(FROM_UNIXTIME(start_ts+?)) d, COUNT(*) c,
+                        COALESCE(SUM(bounce),0) b, COALESCE(SUM(duration),0) du, COALESCE(SUM(is_new),0) nw
+                 FROM sessions WHERE site_id=? AND start_ts>=? AND start_ts<?" . $ssAnd . "
+                 GROUP BY d",
+                array_merge([$offset, $sid, $startTs, $endTs], $ss['args'])
+            ) as $r
+        ) {
+            $d = (string) $r['d'];
+            if (isset($daily[$d])) {
+                $daily[$d]['visits'] = (int) $r['c'];
+                $daily[$d]['bounce'] = (int) $r['b'];
+                $daily[$d]['duration'] = (int) $r['du'];
+                $daily[$d]['new_users'] = (int) $r['nw'];
+            }
+        }
+
+        $trend = [];
+        $sum = ['pv' => 0, 'visits' => 0, 'bounce' => 0, 'duration' => 0, 'new_users' => 0];
+        foreach ($daily as $d => $h) {
+            $trend[] = ['day' => $d, 'pv' => $h['pv'], 'uv' => $h['uv'], 'ipc' => $h['ipc']];
+            $sum['pv'] += $h['pv'];
+            $sum['visits'] += $h['visits'];
+            $sum['bounce'] += $h['bounce'];
+            $sum['duration'] += $h['duration'];
+            $sum['new_users'] += $h['new_users'];
+        }
+
+        // 区间 UV / 独立 IP：跨日必须精确去重（逐日相加会把同一访客在多天里重复计数）
+        $uniq = $this->exactUniq($sid, $start, $end, null, $filters);
+        $visits = $sum['visits'];
+        $totals = [
+            'pv' => $sum['pv'], 'uv' => $uniq['uv'], 'ipc' => $uniq['ipc'], 'visits' => $visits,
+            'bounce' => $sum['bounce'],
+            'bounce_rate' => $visits > 0 ? round($sum['bounce'] / $visits * 100, 1) : 0,
+            'avg_duration' => $visits > 0 ? (int) round($sum['duration'] / $visits) : 0,
+            'new_users' => (int) $sum['new_users'],
+        ];
+        $totals['old_users'] = max(0, (int) $uniq['uv'] - (int) $totals['new_users']);
+
+        // ---- 单日区间：分时序列（同样叠加过滤条件）----
+        $hourly = [];
+        if ($start === $end) {
+            $hmap = [];
+            foreach (
+                Db::select(
+                    "SELECT LPAD(HOUR(FROM_UNIXTIME(ts+?)),2,'0') h,
+                            SUM(type='pageview') pv,
+                            COUNT(DISTINCT CASE WHEN type='pageview' THEN visitor_id END) uv
+                     FROM events WHERE site_id=? AND `day`=?" . $evAnd . " GROUP BY h",
+                    array_merge([$offset, $sid, $start], $ev['args'])
+                ) as $r
+            ) {
+                $hmap[(string) $r['h']] = ['pv' => (int) $r['pv'], 'uv' => (int) $r['uv']];
+            }
+            for ($i = 0; $i < 24; $i++) {
+                $h = sprintf('%02d', $i);
+                $hourly[] = ['hour' => $h . ':00', 'pv' => $hmap[$h]['pv'] ?? 0, 'uv' => $hmap[$h]['uv'] ?? 0];
+            }
+        }
+
+        // ---- 环比：上一期用**同一组过滤条件**，并同样遵守「同时刻对齐」----
+        $len = (int) ((strtotime($end) - strtotime($start)) / 86400) + 1;
+        $pEnd = date('Y-m-d', strtotime($start . ' 00:00:00') - 86400);
+        $pStart = date('Y-m-d', strtotime($pEnd . ' 00:00:00') - ($len - 1) * 86400);
+        $todayLocal = gmdate('Y-m-d', time() + $offset);
+        $cutTs = null;
+        if ($end === $todayLocal) {
+            [$todayStartTs] = Util::dateRangeToTs($todayLocal, $todayLocal, $tz);
+            $elapsed = max(0, time() - $todayStartTs);
+            [, $pEndNext] = Util::dateRangeToTs($pEnd, $pEnd, $tz);
+            $cutTs = $pEndNext - 86400 + $elapsed;
+        }
+        $prev = $this->periodTotals($sid, $pStart, $pEnd, $tz, $cutTs, $filters);
+        $deltas = [];
+        foreach (['pv', 'uv', 'ipc', 'visits', 'bounce_rate', 'avg_duration', 'new_users', 'old_users'] as $k) {
+            $c = (float) ($totals[$k] ?? 0);
+            $p = (float) ($prev[$k] ?? 0);
+            $deltas[$k] = $p > 0 ? round(($c - $p) / $p * 100, 1) : ($c > 0 ? 100.0 : null);
+        }
+
+        $live = $this->live($sid, 0, $offset);
+
+        wstat_json([
+            'site' => $this->siteShape($site),
+            'range' => ['start' => $start, 'end' => $end],
+            'totals' => $totals,
+            'deltas' => $deltas,
+            'deltas_base' => [
+                'start'   => $pStart,
+                'end'     => $pEnd,
+                'cut_ts'  => $cutTs,
+                'aligned' => $cutTs !== null,
+            ],
+            'trend' => $trend,
+            'hourly' => $hourly,
+            'live' => $live,
+            // 过滤信息回显：前端据此渲染条件标签、并提示「哪些维度在本次查询里无效」
+            'filters' => [
+                'list'    => $filters,
+                'label'   => Filter::label($filters),
+                'skipped' => array_values(array_unique(array_merge($ev['skipped'], $ss['skipped']))),
+            ],
+        ]);
+    }
+
+    /**
+     * 等长区间汇总（环比用）：site_daily 优先，覆盖不全时退回 events/sessions 明细聚合。
+     *
+     * $cutTs 非空 = 「只统计到该时间戳为止」（同时刻对齐）。此时 site_daily 的**日粒度**无法表达
+     * 截断，因此强制走明细 —— 这与「今日必须实况」是同一条原则：预聚合只服务完整自然日。
+     */
+    private function periodTotals(int $sid, string $start, string $end, string $tz, ?int $cutTs = null, array $filters = []): array
+    {
+        $pv = 0; $visits = 0; $bounce = 0; $dur = 0; $new = 0;
+        $ev = Filter::sql($filters, 'events');
+        $ss = Filter::sql($filters, 'sessions');
+
+        // 有过滤器时必须走明细：site_daily 是「全站 × 天」的预聚合，无法表达任何维度条件
+        if ($cutTs === null && !Filter::active($filters)) {
+            $rows = Db::select(
+                'SELECT pv,visits,bounce,duration,new_users FROM site_daily
+                 WHERE site_id=? AND `day` BETWEEN ? AND ?',
+                [$sid, $start, $end]
+            );
+            foreach ($rows as $r) {
+                $pv += (int) $r['pv'];
+                $visits += (int) $r['visits'];
+                $bounce += (int) $r['bounce'];
+                $dur += (int) $r['duration'];
+                $new += (int) $r['new_users'];
+            }
+            $expected = (int) ((strtotime($end) - strtotime($start)) / 86400) + 1;
+            $partial = count($rows) < $expected;
+        } else {
+            $partial = true;
+        }
 
         // UV/IP 精确去重：与 overview 共用同一条 SQL，环比数字必须与主指标同口径
-        $uniq = $this->exactUniq($sid, $start, $end);
+        $uniq = $this->exactUniq($sid, $start, $end, $cutTs, $filters);
         $uv = $uniq['uv'];
         $ipc = $uniq['ipc'];
         if ($partial) {
-            $pv2 = (int) Db::value(
-                "SELECT COUNT(*) FROM events WHERE site_id=? AND type='pageview' AND `day` BETWEEN ? AND ?",
-                [$sid, $start, $end]
-            );
+            $pvSql = "SELECT COUNT(*) FROM events WHERE site_id=? AND type='pageview' AND `day` BETWEEN ? AND ?";
+            $pvArgs = [$sid, $start, $end];
+            // 过滤条件必须紧跟在它自己的占位符之后、截断条件之前 —— 顺序错位就会整段参数右移
+            if ($ev['sql'] !== '') {
+                $pvSql .= ' AND ' . $ev['sql'];
+                $pvArgs = array_merge($pvArgs, $ev['args']);
+            }
+            if ($cutTs !== null) {
+                $pvSql .= ' AND ts<=?';
+                $pvArgs[] = $cutTs;
+            }
+            $pv2 = (int) Db::value($pvSql, $pvArgs);
             if ($pv2 > $pv) {
                 $pv = $pv2;
             }
         }
         if ($partial) {
             [$ts0, $ts1] = Util::dateRangeToTs($start, $end, $tz);
-            $s = Db::first(
-                'SELECT COUNT(*) c, COALESCE(SUM(bounce),0) b, COALESCE(SUM(duration),0) du,
+            // 同时刻对齐：把上界收到与今天相同的时刻（否则上期多算一整段）
+            if ($cutTs !== null) {
+                $ts1 = min($ts1, $cutTs);
+            }
+            $ssSql = 'SELECT COUNT(*) c, COALESCE(SUM(bounce),0) b, COALESCE(SUM(duration),0) du,
                         COALESCE(SUM(is_new),0) nw
-                 FROM sessions WHERE site_id=? AND start_ts>=? AND start_ts<?',
-                [$sid, $ts0, $ts1]
-            );
+                 FROM sessions WHERE site_id=? AND start_ts>=? AND start_ts<?';
+            $ssArgs = [$sid, $ts0, $ts1];
+            if ($ss['sql'] !== '') {
+                $ssSql .= ' AND ' . $ss['sql'];
+                $ssArgs = array_merge($ssArgs, $ss['args']);
+            }
+            $s = Db::first($ssSql, $ssArgs);
             if ($s) {
                 $visits = max($visits, (int) $s['c']);
                 $bounce = max($bounce, (int) $s['b']);
@@ -398,15 +668,26 @@ class StatsController
      * 这是全站 UV / 独立 IP 的唯一口径来源 —— 概览、环比、大屏、IP 地域页都必须经由它，
      * 保证同一站点同一区间在任何页面看到的数字完全一致（是否部署 Redis 都不影响结果）。
      * 独立 IP 排除空串（取不到真实 IP 的事件不计入），与 IP 地域页的 `ip<>''` 口径一致。
+     *
+     * $cutTs 非空时只统计 `ts <= $cutTs` 的事件（环比「同时刻对齐」用）。
+     * $filters 非空时叠加全局过滤条件（`Filter::sql()` 编译，占位符与参数同源）。
      */
-    private function exactUniq(int $sid, string $start, string $end): array
+    private function exactUniq(int $sid, string $start, string $end, ?int $cutTs = null, array $filters = []): array
     {
-        $r = Db::first(
-            "SELECT COUNT(DISTINCT visitor_id) uv,
-                    COUNT(DISTINCT CASE WHEN ip<>'' THEN ip END) ipc
-             FROM events WHERE site_id=? AND type='pageview' AND `day` BETWEEN ? AND ?",
-            [$sid, $start, $end]
-        ) ?: [];
+        $sql = "SELECT COUNT(DISTINCT visitor_id) uv,
+                       COUNT(DISTINCT CASE WHEN ip<>'' THEN ip END) ipc
+                FROM events WHERE site_id=? AND type='pageview' AND `day` BETWEEN ? AND ?";
+        $args = [$sid, $start, $end];
+        $ev = Filter::sql($filters, 'events');
+        if ($ev['sql'] !== '') {
+            $sql .= ' AND ' . $ev['sql'];
+            $args = array_merge($args, $ev['args']);
+        }
+        if ($cutTs !== null) {
+            $sql .= ' AND ts<=?';
+            $args[] = $cutTs;
+        }
+        $r = Db::first($sql, $args) ?: [];
         return ['uv' => (int) ($r['uv'] ?? 0), 'ipc' => (int) ($r['ipc'] ?? 0)];
     }
 
@@ -443,6 +724,11 @@ class StatsController
         $w = 'site_id=? AND type="pageview" AND `day` BETWEEN ? AND ?';
         $args = [$sid, $start, $end];
         $types = ['direct', 'search', 'social', 'link', 'paid', 'utm', 'internal'];
+
+        // 全局过滤器：本页数据全部来自 events（8 维全支持，不会出现 skipped）
+        [$filters, $ev] = $this->filterOf($req);
+        $w .= $ev['and'];
+        $args = array_merge($args, $ev['args']);
 
         // 预检：来源分析查询依赖归因扩展列；库未跑增量迁移时给出明确提示而非 SQLSTATE 500
         $missing = [];
@@ -553,7 +839,7 @@ class StatsController
         // 说明：UTM 投放系列与广告平台（ClickID）已统一归口「广告追踪」页（/api/stats/ads），
         // 本接口不再返回 campaigns / ads，避免同一批数据两处展示、口径分裂。
 
-        wstat_json([
+        wstat_json($this->withFilters([
             'site' => $this->siteShape($site),
             'range' => ['start' => $start, 'end' => $end],
             'total_pv' => $totalPv,
@@ -563,7 +849,7 @@ class StatsController
             'engines' => $enginesOut,
             'terms' => $terms,
             'no_kw_pv' => $noKwPv,
-        ]);
+        ], $filters, $ev));
     }
 
     /**
@@ -612,6 +898,11 @@ class StatsController
 
         $w = 'site_id=? AND type="pageview" AND `day` BETWEEN ? AND ?';
         $args = [$sid, $start, $end];
+
+        // 全局过滤器：引擎/关键词取自 events，搜索落地页取自 sessions —— 两侧都要拼
+        [$filters, $ev, $ss] = $this->filterOf($req);
+        $w .= $ev['and'];
+        $args = array_merge($args, $ev['args']);
 
         // 全站 PV（分母：搜索渠道占比）
         $totalPv = (int) Db::value("SELECT COUNT(*) FROM events WHERE $w", $args);
@@ -710,9 +1001,9 @@ class StatsController
                 Db::select(
                     "SELECT entry_url url, COUNT(*) sv, COUNT(DISTINCT visitor_id) uv
                      FROM sessions
-                     WHERE site_id=? AND source='search' AND start_ts>=? AND start_ts<?
+                     WHERE site_id=? AND source='search' AND start_ts>=? AND start_ts<?" . $ss['and'] . "
                      GROUP BY entry_url ORDER BY sv DESC LIMIT 20",
-                    [$sid, $startTs, $endTs]
+                    array_merge([$sid, $startTs, $endTs], $ss['args'])
                 ) as $r
             ) {
                 $landing[] = [
@@ -723,7 +1014,7 @@ class StatsController
             }
         }
 
-        wstat_json([
+        wstat_json($this->withFilters([
             'site'    => $this->siteShape($site),
             'range'   => ['start' => $start, 'end' => $end],
             'summary' => [
@@ -741,7 +1032,7 @@ class StatsController
             'trend'   => ['days' => $days, 'series' => $seriesRows, 'totals' => $totals],
             'landing' => $landing,
             'terms'   => $terms,
-        ]);
+        ], $filters, $ev, $ss));
     }
 
     /** GET /api/stats/sessions?site_id=&page=&size=&start=&end=&q= */
@@ -780,7 +1071,20 @@ class StatsController
                 $args[] = '%' . $this->likeEscape($fval) . '%';
             }
         }
-        $hasFilter = $q !== '' || (bool) array_filter(array_map(fn ($c) => trim((string) $req->input($c, '')), ['browser', 'os', 'device', 'source']));
+        // 全局过滤器（sessions 侧；`ref_host` 在 sessions 表无对应列，会被编译器跳过并回报）
+        // 注意顺序：filterOf() 返回 [条件, events 片段, sessions 片段]。
+        // 本页只用 sessions 片段，**必须跳过中间那个** —— 写成 `[$filters, $ss]` 会按顺序取到
+        // events 片段（PHP 解构是按位置的），症状是 `Unknown column 'ref_host'`：
+        // events 支持该维度、sessions 不支持。
+        [$filters, , $ss] = $this->filterOf($req);
+        $where .= $ss['and'];
+        $args = array_merge($args, $ss['args']);
+
+        // 有全局过滤器时同样算「已筛选」：Redis 里的「打开中会话」不经过 SQL 过滤，
+        // 混进来会出现不符合条件的行，因此一并关闭实时前置（与概览 live 不受过滤影响是两回事：
+        // live 是「此刻谁在站上」，而这里是历史明细列表，必须与条件一致）。
+        $hasFilter = $q !== '' || Filter::active($filters)
+            || (bool) array_filter(array_map(fn ($c) => trim((string) $req->input($c, '')), ['browser', 'os', 'device', 'source']));
         $total = (int) Db::value("SELECT COUNT(*) FROM sessions WHERE $where", $args);
         $ipCol = isset(Db::tableColumns('sessions')['ip']) ? ',ip' : '';
         $euCol = isset(Db::tableColumns('sessions')['end_user']) ? ',end_user' : '';
@@ -832,7 +1136,11 @@ class StatsController
                 $total += count($pre);
             }
         }
-        wstat_json(['items' => $rows, 'total' => $total, 'page' => $page, 'size' => $size]);
+        wstat_json($this->withFilters(
+            ['items' => $rows, 'total' => $total, 'page' => $page, 'size' => $size],
+            $filters,
+            $ss
+        ));
     }
 
     /** GET /api/stats/sessions/{id}?site_id=  单个会话 + 完整行为日志 */
@@ -1243,6 +1551,11 @@ class StatsController
         $w = 'site_id=? AND type="perf" AND `day` BETWEEN ? AND ?';
         $args = [$sid, $start, $end];
 
+        // 全局过滤器：本页取自 events（perf 事件行上的维度条件同样适用）
+        [$filters, $ev] = $this->filterOf($req);
+        $w .= $ev['and'];
+        $args = array_merge($args, $ev['args']);
+
         $avgExpr = function (string $m): string {
             return "ROUND(AVG(CAST(JSON_UNQUOTE(JSON_EXTRACT(payload,'\$." . $m . "')) AS DECIMAL(12,3))),3) AS `" . $m . '`';
         };
@@ -1273,12 +1586,12 @@ class StatsController
         }
         unset($p);
 
-        wstat_json([
+        wstat_json($this->withFilters([
             'site' => $this->siteShape($site),
             'range' => ['start' => $start, 'end' => $end],
             'totals' => $totals,
             'pages' => $pages,
-        ]);
+        ], $filters, $ev));
     }
 
     /** GET /api/stats/realtime?site_id=  实时访客（进行中会话 + 在线 + 今日实时） */
@@ -1510,6 +1823,13 @@ class StatsController
         $w = 'site_id=? AND start_ts>=? AND start_ts<?';
         $args = [$sid, $startTs, $endTs];
 
+        // 全局过滤器：本页地域/会话取自 sessions，IP 统计与覆盖率诊断取自 events —— 两侧都要拼
+        [$filters, $ev, $ss] = $this->filterOf($req);
+        $w .= $ss['and'];
+        $args = array_merge($args, $ss['args']);
+        $ew = 'site_id=? AND `day` BETWEEN ? AND ?' . $ev['and'];
+        $eargs = array_merge([$sid, $start, $end], $ev['args']);
+
         $total = (int) Db::value("SELECT COUNT(*) FROM sessions WHERE $w", $args);
         $geoVisits = (int) Db::value("SELECT COUNT(*) FROM sessions WHERE $w AND country<>''", $args);
 
@@ -1538,35 +1858,23 @@ class StatsController
         $ips = Db::select(
             "SELECT ip, COUNT(DISTINCT session_id) AS visits, COUNT(DISTINCT visitor_id) AS uv,
                     COUNT(*) AS pv
-             FROM events WHERE site_id=? AND type='pageview' AND `day` BETWEEN ? AND ? AND ip<>''
+             FROM events WHERE $ew AND type='pageview' AND ip<>''
              GROUP BY ip ORDER BY pv DESC, visits DESC LIMIT 100",
-            [$sid, $start, $end]
+            $eargs
         );
         // 区间独立 IP 总数（精确，与概览 ipc 完全一致；IP 列表受 LIMIT 100 截断时以本值为准）
-        $ipTotal = $this->exactUniq($sid, $start, $end)['ipc'];
+        $ipTotal = $this->exactUniq($sid, $start, $end, null, $filters)['ipc'];
 
         // 诊断：驱动/离线库状态 + 区间内地理字段覆盖率（前端据此给出「为什么没有地域数据」的具体原因）
         $st = IpLocator::status();
-        $evTotal = (int) Db::value(
-            'SELECT COUNT(*) FROM events WHERE site_id=? AND `day` BETWEEN ? AND ?',
-            [$sid, $start, $end]
-        );
-        $evGeo = (int) Db::value(
-            "SELECT COUNT(*) FROM events WHERE site_id=? AND `day` BETWEEN ? AND ? AND country<>''",
-            [$sid, $start, $end]
-        );
+        $evTotal = (int) Db::value("SELECT COUNT(*) FROM events WHERE $ew", $eargs);
+        $evGeo = (int) Db::value("SELECT COUNT(*) FROM events WHERE $ew AND country<>''", $eargs);
         // IPv6 访客单独计数：地域库分 v4/v6 两份，只有分开看才能定位「是 v6 库缺了」
         // 还是「整体都没解析」（ip 里有冒号即为 IPv6，含 ::ffff: 映射形式）
-        $evIpv6 = (int) Db::value(
-            "SELECT COUNT(*) FROM events WHERE site_id=? AND `day` BETWEEN ? AND ? AND ip LIKE '%:%'",
-            [$sid, $start, $end]
-        );
-        $evIpv6Geo = (int) Db::value(
-            "SELECT COUNT(*) FROM events WHERE site_id=? AND `day` BETWEEN ? AND ? AND ip LIKE '%:%' AND country<>''",
-            [$sid, $start, $end]
-        );
+        $evIpv6 = (int) Db::value("SELECT COUNT(*) FROM events WHERE $ew AND ip LIKE '%:%'", $eargs);
+        $evIpv6Geo = (int) Db::value("SELECT COUNT(*) FROM events WHERE $ew AND ip LIKE '%:%' AND country<>''", $eargs);
 
-        wstat_json([
+        wstat_json($this->withFilters([
             'site' => $this->siteShape($site),
             'range' => ['start' => $start, 'end' => $end],
             'total_visits' => $total,
@@ -1594,7 +1902,7 @@ class StatsController
                 'sessions_total' => $total,
                 'sessions_geo' => $geoVisits,
             ],
-        ]);
+        ], $filters, $ev, $ss));
     }
 
     /**
@@ -1609,19 +1917,24 @@ class StatsController
         [$startTs, $endTs] = Util::dateRangeToTs($start, $end, (string) $site['timezone']);
         $sid = (int) $site['id'];
 
+        // 全局过滤器：页面级维度取自 events，入口/退出页取自 sessions（两侧都要拼）
+        // 本方法里已有闭包变量 $ev / $sess，故编译结果命名 $evF / $ssF 以免遮蔽
+        [$filters, $evF, $ssF] = $this->filterOf($req);
+
         $totalPv = (int) Db::value(
-            "SELECT COUNT(*) FROM events WHERE site_id=? AND type='pageview' AND `day` BETWEEN ? AND ?",
-            [$sid, $start, $end]
+            "SELECT COUNT(*) FROM events WHERE site_id=? AND type='pageview' AND `day` BETWEEN ? AND ?" . $evF['and'],
+            array_merge([$sid, $start, $end], $evF['args'])
         );
         $pct = static fn (int $pv): float => $totalPv > 0 ? round($pv / $totalPv * 100, 2) : 0.0;
 
         // events 维度聚合（pageview 事件，idx_site_day_type 索引；$col 为内部白名单调用，无注入面）
-        $ev = function (string $col, string $cond = '') use ($sid, $start, $end, $pct): array {
+        // $cond 是无占位符的字面量条件，因此可安全地排在过滤片段之前（参数序列不受影响）
+        $ev = function (string $col, string $cond = '') use ($sid, $start, $end, $pct, $evF): array {
             $rows = Db::select(
                 "SELECT `$col` AS name, COUNT(*) AS pv
-                 FROM events WHERE site_id=? AND type='pageview' AND `day` BETWEEN ? AND ? $cond
+                 FROM events WHERE site_id=? AND type='pageview' AND `day` BETWEEN ? AND ? $cond" . $evF['and'] . "
                  GROUP BY `$col` ORDER BY pv DESC LIMIT 50",
-                [$sid, $start, $end]
+                array_merge([$sid, $start, $end], $evF['args'])
             );
             $out = [];
             foreach ($rows as $r) {
@@ -1637,20 +1950,24 @@ class StatsController
 
         // sessions 维度（入口/退出 URL：PV=SUM(pageviews)，idx_site_start 索引；
         // 实时合并「打开中会话」——关闭落库时移出 live 集合，与上表不重复）
-        $sess = function (string $col) use ($sid, $startTs, $endTs, $pct): array {
+        $sess = function (string $col) use ($sid, $startTs, $endTs, $pct, $ssF, $filters): array {
             $agg = [];
             foreach (
                 Db::select(
                     "SELECT `$col` AS name, COALESCE(SUM(pageviews),0) AS pv
-                     FROM sessions WHERE site_id=? AND start_ts>=? AND start_ts<? AND `$col`<>''
+                     FROM sessions WHERE site_id=? AND start_ts>=? AND start_ts<?" . $ssF['and'] . " AND `$col`<>''
                      GROUP BY `$col` ORDER BY pv DESC LIMIT 50",
-                    [$sid, $startTs, $endTs]
+                    array_merge([$sid, $startTs, $endTs], $ssF['args'])
                 ) as $r
             ) {
                 $agg[(string) $r['name']] = (int) $r['pv'];
             }
-            foreach (($this->liveEntryExit($sid, $startTs, $endTs)[$col] ?? []) as $name => $c) {
-                $agg[(string) $name] = ($agg[(string) $name] ?? 0) + (int) $c['pv'];
+            // 实时合并「打开中会话」只在无过滤时进行：Redis 里的行不经过 SQL 过滤，
+            // 混进来会出现不符合条件的入口页（与 sessions 明细列表同一处理）
+            if (!Filter::active($filters)) {
+                foreach (($this->liveEntryExit($sid, $startTs, $endTs)[$col] ?? []) as $name => $c) {
+                    $agg[(string) $name] = ($agg[(string) $name] ?? 0) + (int) $c['pv'];
+                }
             }
             arsort($agg);
             $out = [];
@@ -1660,7 +1977,7 @@ class StatsController
             return $out;
         };
 
-        wstat_json([
+        wstat_json($this->withFilters([
             'site' => $this->siteShape($site),
             'range' => ['start' => $start, 'end' => $end],
             'total_pv' => $totalPv,
@@ -1675,7 +1992,7 @@ class StatsController
             'countries' => $ev('country', "AND country<>''"),
             'provinces' => $ev('province', "AND province<>'' AND country IN ('中国','China')"),
             'cities' => $ev('city', "AND city<>''"),
-        ]);
+        ], $filters, $evF, $ssF));
     }
 
     /* ==================== 单页面（URL）下钻详情 ==================== */
@@ -1724,6 +2041,15 @@ class StatsController
             $condArgs = [$url, $url];
         }
 
+        // 全局过滤器（本页要同时作用于 events 与 sessions 两侧）
+        //  · events：叠加进 $condSql —— 所有 events 查询与流向分析都共用它，一处改全生效；
+        //    注意它会出现在带 JOIN 的 SQL 里，而 Filter 产出的是**裸列名**，靠现有 JOIN
+        //    的子查询只暴露 session_id/site_id 保证无歧义（与 sessions 表同名列不冲突）。
+        //  · sessions：见下方会话指标 / 入口退出计数几处。
+        [$filters, $evF, $ssF] = $this->filterOf($req);
+        $condSql .= $evF['and'];
+        $condArgs = array_merge($condArgs, $evF['args']);
+
         $base = [$sid, $start, $end, ...$condArgs];
 
         // ---- 1) 汇总 ----
@@ -1755,8 +2081,8 @@ class StatsController
                    WHERE site_id=? AND type='pageview' AND `day` BETWEEN ? AND ? $condSql
                    LIMIT " . self::PAGE_SESS_MAX . ") x
                ON x.session_id=s.session_id AND x.site_id=s.site_id
-             WHERE s.site_id=? AND s.start_ts>=? AND s.start_ts<?",
-            [...$base, $sid, $startTs, $endTs]
+             WHERE s.site_id=? AND s.start_ts>=? AND s.start_ts<?" . $ssF['and'],
+            [...$base, $sid, $startTs, $endTs, ...$ssF['args']]
         ) ?: ['c' => 0, 'b' => 0, 'du' => 0];
         $sessCnt = (int) $sessAgg['c'];
         $avgDur = $sessCnt > 0 ? round((int) $sessAgg['du'] / $sessCnt, 1) : 0;
@@ -1771,15 +2097,16 @@ class StatsController
             : 'exit_url = ?';
         $entryVal = $match === 'prefix' ? $this->likeEscape($url) . '%' : $url;
         $entryCnt = (int) Db::value(
-            "SELECT COUNT(*) FROM sessions WHERE site_id=? AND start_ts>=? AND start_ts<? AND $entryCond",
-            [$sid, $startTs, $endTs, $entryVal]
+            "SELECT COUNT(*) FROM sessions WHERE site_id=? AND start_ts>=? AND start_ts<? AND $entryCond" . $ssF['and'],
+            [$sid, $startTs, $endTs, $entryVal, ...$ssF['args']]
         );
         $exitCnt = (int) Db::value(
-            "SELECT COUNT(*) FROM sessions WHERE site_id=? AND start_ts>=? AND start_ts<? AND $exitCond",
-            [$sid, $startTs, $endTs, $entryVal]
+            "SELECT COUNT(*) FROM sessions WHERE site_id=? AND start_ts>=? AND start_ts<? AND $exitCond" . $ssF['and'],
+            [$sid, $startTs, $endTs, $entryVal, ...$ssF['args']]
         );
         // 实时合并「打开中会话」（尚未结算落库，关闭后自动并入上表口径）
-        $liveEE = $this->liveEntryExit($sid, $startTs, $endTs);
+        // 有全局过滤器时跳过：Redis 里的行不经过 SQL 过滤
+        $liveEE = Filter::active($filters) ? ['entry_url' => [], 'exit_url' => []] : $this->liveEntryExit($sid, $startTs, $endTs);
         foreach ($liveEE['entry_url'] as $u => $c) {
             if ($match === 'prefix' ? str_starts_with($u, $url) : $u === $url) {
                 $entryCnt += (int) $c['visits'];
@@ -1905,7 +2232,7 @@ class StatsController
             [...$base]
         );
 
-        wstat_json([
+        wstat_json($this->withFilters([
             'site' => $this->siteShape($site),
             'range' => ['start' => $start, 'end' => $end],
             'url' => $url,
@@ -1943,7 +2270,7 @@ class StatsController
             'next_pages' => $nextPages,
             'prev_pages' => $prevPages,
             'recent_sessions' => $recentSessions,
-        ]);
+        ], $filters, $evF, $ssF));
     }
 
     /**
@@ -1960,6 +2287,13 @@ class StatsController
         $sid = (int) $site['id'];
         $w = 'site_id=? AND start_ts>=? AND start_ts<?';
         $args = [$sid, $startTs, $endTs];
+
+        // 全局过滤器：本页全部指标取自 sessions（`ref_host` 在 sessions 表无对应列，
+        // 会被编译器跳过并在 filters.skipped 里回报，而不是静默失效）
+        // 顺序提醒：filterOf() = [条件, events 片段, sessions 片段]，本页只要第 3 个。
+        [$filters, , $ss] = $this->filterOf($req);
+        $w .= $ss['and'];
+        $args = array_merge($args, $ss['args']);
 
         // ---- 访问总量指标 ----
         $tot = Db::first(
@@ -2033,7 +2367,10 @@ class StatsController
             }
             return $out;
         };
-        $liveEE = $this->liveEntryExit($sid, $startTs, $endTs);
+        // 实时合并「打开中会话」只在无过滤时进行：Redis 里的行不经过 SQL 过滤
+        $liveEE = Filter::active($filters)
+            ? ['entry_url' => [], 'exit_url' => []]
+            : $this->liveEntryExit($sid, $startTs, $endTs);
         $entries = $this->mergeLiveRank($pageRank('entry_url'), $liveEE['entry_url'], 'visits', 10);
         $exits = $this->mergeLiveRank($pageRank('exit_url'), $liveEE['exit_url'], 'visits', 10);
 
@@ -2066,7 +2403,7 @@ class StatsController
 
         $uv = (int) $tot['uv'];
         $visits = (int) $tot['visits'];
-        wstat_json([
+        wstat_json($this->withFilters([
             'site' => $this->siteShape($site),
             'range' => ['start' => $start, 'end' => $end],
             'totals' => [
@@ -2096,7 +2433,7 @@ class StatsController
             'devices' => $dim('device'),
             'screens' => $dim('screen'),
             'langs' => $dim('lang'),
-        ]);
+        ], $filters, $ss));
     }
 
     /* ================= 内部 ================= */
@@ -2638,6 +2975,135 @@ class StatsController
         wstat_json(['ok' => true]);
     }
 
+    /* ==================== 全局过滤器 · 命名分段（Segments） ==================== */
+
+    /**
+     * segments 表是否可用（老库未跑增量迁移时**不报错**）。
+     * 列表接口返回 available=false（前端把分段下拉置为不可用），写入接口给出升级指引 ——
+     * 过滤条件本身仍可直接写在 URL 的 `?f=[...]` 上使用，不依赖该表。
+     */
+    private function segmentReady(): bool
+    {
+        try {
+            return count(Db::tableColumns('segments')) > 0;
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /** GET /api/stats/segments?site_id=  该站点的命名分段列表（viewer 及以上） */
+    public function segments(Request $req): void
+    {
+        $site = $this->own($req, (int) $req->input('site_id', 0), SiteAccess::VIEWER);
+        if (!$this->segmentReady()) {
+            wstat_json(['site' => $this->siteShape($site), 'available' => false, 'items' => []]);
+            return;
+        }
+        $items = [];
+        foreach (
+            Db::select(
+                'SELECT id,name,params,created_at,updated_at FROM segments WHERE site_id=? ORDER BY id DESC LIMIT 200',
+                [(int) $site['id']]
+            ) as $r
+        ) {
+            // 读取时同样过一遍白名单：手工改库/迁移遗留的脏条件不会带进查询
+            $conds = Filter::parse((string) $r['params']);
+            $items[] = [
+                'id'         => (int) $r['id'],
+                'name'       => (string) $r['name'],
+                'params'     => $conds,
+                'label'      => Filter::label($conds),
+                'created_at' => (int) $r['created_at'],
+                'updated_at' => (int) $r['updated_at'],
+            ];
+        }
+        wstat_json(['site' => $this->siteShape($site), 'available' => true, 'items' => $items]);
+    }
+
+    /** POST /api/stats/segments  新建分段（需 editor）：把当前过滤条件存成可复用的切片 */
+    public function segmentSave(Request $req): void
+    {
+        $site = $this->own($req, (int) $req->input('site_id', 0), SiteAccess::EDITOR);
+        if (!$this->segmentReady()) {
+            wstat_err('命名分段需要先执行升级脚本 sql/upgrade-2026-09-22-segments.sql', 500);
+            return;
+        }
+        $u = \Wstat\Support\Auth::requireUser($req);
+        [$name, $conds] = $this->segmentInput($req);
+        $id = Db::insert('segments', [
+            'site_id'    => (int) $site['id'],
+            'name'       => $name,
+            'params'     => json_encode($conds, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+            'created_by' => (int) $u['id'],
+            'created_at' => time(),
+            'updated_at' => time(),
+        ]);
+        wstat_json([
+            'id'     => $id,
+            'name'   => $name,
+            'params' => $conds,
+            'label'  => Filter::label($conds),
+        ]);
+    }
+
+    /** PATCH /api/stats/segments/{id}  改名 / 改条件（需 editor） */
+    public function segmentUpdate(Request $req): void
+    {
+        $seg = $this->segmentOwn($req, (int) $req->param('id'));
+        [$name, $conds] = $this->segmentInput($req);
+        Db::execute(
+            'UPDATE segments SET name=?, params=?, updated_at=? WHERE id=?',
+            [$name, json_encode($conds, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), time(), (int) $seg['id']]
+        );
+        wstat_json(['ok' => true, 'id' => (int) $seg['id'], 'name' => $name, 'label' => Filter::label($conds)]);
+    }
+
+    /** DELETE /api/stats/segments/{id}  删除分段（需 editor） */
+    public function segmentDelete(Request $req): void
+    {
+        $seg = $this->segmentOwn($req, (int) $req->param('id'));
+        SiteAccess::require($req, (int) $seg['site_id'], SiteAccess::EDITOR);
+        Db::execute('DELETE FROM segments WHERE id=?', [(int) $seg['id']]);
+        wstat_json(['ok' => true]);
+    }
+
+    /**
+     * 归一化分段输入：名称 ≤100 字；条件经 `Filter::parse()` 走白名单过滤后**至少保留 1 条**。
+     * 允许直接贴 URL 上的 `f` 参数（`params` 与 `f` 二选一），前端「保存当前筛选」即是此路径。
+     */
+    private function segmentInput(Request $req): array
+    {
+        $name = trim((string) $req->input('name', ''));
+        if ($name === '' || mb_strlen($name) > 100) {
+            wstat_err('分段名称必填且不超过 100 字', 422);
+        }
+        $raw = $req->input('params', null);
+        if ($raw === null || $raw === '') {
+            $raw = $req->input('f', null);
+        }
+        $conds = Filter::parse($raw);
+        if (count($conds) === 0) {
+            wstat_err('至少要有一个有效过滤条件', 422);
+        }
+        return [$name, $conds];
+    }
+
+    /** 取分段并校验站点权限（默认需 editor，读场景可传 viewer） */
+    private function segmentOwn(Request $req, int $id, string $min = SiteAccess::EDITOR): array
+    {
+        if (!$this->segmentReady()) {
+            wstat_err('命名分段需要先执行升级脚本 sql/upgrade-2026-09-22-segments.sql', 500);
+            return [];
+        }
+        $s = Db::first('SELECT id,site_id,name,params,created_at FROM segments WHERE id=? LIMIT 1', [$id]);
+        if ($s === null) {
+            wstat_err('分段不存在', 404, 404);
+            return [];
+        }
+        SiteAccess::require($req, (int) $s['site_id'], $min);
+        return $s;
+    }
+
     /**
      * GET /api/stats/funnels/{id}/data?start=&end=&ordered=1
      * 转化统计：逐级累计「命中前 N 步」的去重会话数（events pageview，session_id 去重）。
@@ -2958,11 +3424,15 @@ class StatsController
 
         $this->requireSourceColumns();
 
-        $wAll = 'site_id=? AND type="pageview" AND `day` BETWEEN ? AND ?';
+        // 全局过滤器：付费与全站的 events 侧、付费落地页的 sessions 侧都要拼
+        // （`ADS_PAID_W` 是纯字面量常量、不含占位符，排在过滤片段前后都不影响参数序列）
+        [$filters, $ev, $ss] = $this->filterOf($req);
+
+        $wAll = 'site_id=? AND type="pageview" AND `day` BETWEEN ? AND ?' . $ev['and'];
         $wPaid = $wAll . ' AND ' . self::ADS_PAID_W;
-        $args = [$sid, $start, $end];
-        $wSessPaid = 'site_id=? AND start_ts>=? AND start_ts<? AND ' . self::ADS_PAID_W;
-        $sessArgs = [$sid, $startTs, $endTs];
+        $args = array_merge([$sid, $start, $end], $ev['args']);
+        $wSessPaid = 'site_id=? AND start_ts>=? AND start_ts<? AND ' . self::ADS_PAID_W . $ss['and'];
+        $sessArgs = array_merge([$sid, $startTs, $endTs], $ss['args']);
 
         // ---- 汇总 ----
         $paidPv = (int) Db::value("SELECT COUNT(*) FROM events WHERE $wPaid", $args);
@@ -2972,7 +3442,7 @@ class StatsController
              FROM sessions WHERE $wSessPaid", $sessArgs
         ) ?: ['v' => 0, 'b' => 0, 'd' => 0, 'n' => 0];
         $qAll = Db::first(
-            'SELECT COUNT(*) v FROM sessions WHERE site_id=? AND start_ts>=? AND start_ts<?',
+            'SELECT COUNT(*) v FROM sessions WHERE site_id=? AND start_ts>=? AND start_ts<?' . $ss['and'],
             $sessArgs
         ) ?: ['v' => 0];
         $paidVisits = (int) $q['v'];
@@ -3037,7 +3507,7 @@ class StatsController
         }
         unset($l);
 
-        wstat_json([
+        wstat_json($this->withFilters([
             'site'  => $this->siteShape($site),
             'range' => ['start' => $start, 'end' => $end],
             'totals' => [
@@ -3055,7 +3525,7 @@ class StatsController
             'platforms' => $byPlatform,
             'terms'     => $byTerm,
             'landings'  => $landings,
-        ]);
+        ], $filters, $ev, $ss));
     }
 
     /* ================= 点击热力图 ================= */

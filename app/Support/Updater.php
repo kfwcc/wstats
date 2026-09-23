@@ -15,6 +15,14 @@
  *     客户端据此只提示「下载完整包手工迁移」——自动搬目录的风险远大于收益。
  *  5. 更新包内的 sql/upgrade-*.sql（相对基线新增的）在文件写入后执行；SQL 失败不自动回滚文件，
  *     但在结果里明确列出已执行语句与失败原因（数据库回滚无法保证，宁可如实报告）。
+ *  6. **跨版本升级 = 链式应用多个增量包**：每个增量包只针对紧邻的上一版做基线，
+ *     停在旧版本的站点升不上去。更新服务端会把 N 个历史增量包串成一条链（chain[]）下发，
+ *     applyChain() 依次应用 —— 之所以成立，是因为每个包的清单里带的都是**完整文件内容 +
+ *     绝对 sha256**（不是二进制 diff），所以 A→B→C 的叠加结果与 A→C 一致。
+ *     链断掉 / 步数太多 / 跨目录布局时，服务端会把 mode 置为 full，客户端回落到完整包。
+ *  7. **SQL 漏跑补偿**：分步升级 + 每步「先写文件、后执行 SQL」，进程若在两者之间被杀，
+ *     版本号已经前进，链会从新版本重算 —— 那一步的 SQL 就再也没人补。因此执行前把待执行
+ *     脚本记到 data/pending-sql.json，下一次升级进来时先补执行再继续（见 flushPendingSql）。
  */
 declare(strict_types=1);
 
@@ -26,6 +34,16 @@ use ZipArchive;
 final class Updater
 {
     public const PRODUCT = 'webstats';
+
+    /**
+     * 单次请求内跑完升级链的软时间预算（秒）。
+     *
+     * 跨版本升级要连着下载并应用好几个增量包，而 PHP 的 max_execution_time 在共享主机上
+     * 常被压到 30s 甚至更低，网关也常卡 60s。与其撞上去被硬杀在半路（那才是真麻烦：
+     * 文件写完、SQL 没跑），不如自己控节奏 —— 超预算就干净地返回 done=false，
+     * 前端立刻再发一次请求接着从当前版本续跑（链是按「当前实际版本」重算的，天然可续）。
+     */
+    public const CHAIN_BUDGET = 20;
 
     /* ===================== 版本 / 布局 ===================== */
 
@@ -126,7 +144,8 @@ final class Updater
     /**
      * 检查更新。返回结构：
      *   ok(bool) version latest has_update can_auto requires_full reason
-     *   changelog[] notes update_url update_sha256 update_size full_url full_size released_at php_ok
+     *   changelog[] notes update_url update_sha256 update_size update_from full_url full_size released_at php_ok
+     *   upgrade_mode direct|chain|full|none  chain[]（升序步骤）chain_len chain_reason min_auto_version
      */
     public static function check(): array
     {
@@ -150,11 +169,18 @@ final class Updater
             'update_sha256' => '',
             'update_size' => 0,
             'update_type' => '',
+            'update_from' => '',
             'full_url' => '',
             'full_size' => 0,
             'released_at' => '',
             'php_ok' => true,
             'update_enabled' => (bool) wstat_config('update.enabled'),
+            // 跨版本升级（服务端 versions.json 里的链）
+            'upgrade_mode' => '',
+            'chain' => [],
+            'chain_len' => 0,
+            'chain_reason' => '',
+            'min_auto_version' => '',
         ];
         if ($url === '') {
             $out['reason'] = '未配置更新服务地址（config.php 的 update_check_url）';
@@ -187,9 +213,56 @@ final class Updater
         $out['update_sha256'] = strtolower((string) ($d['update_sha256'] ?? ''));
         $out['update_size'] = (int) ($d['update_size'] ?? 0);
         $out['update_type'] = (string) ($d['update_type'] ?? '');
+        $out['update_from'] = (string) ($d['update_from'] ?? '');
         $out['full_url'] = (string) ($d['full_url'] ?? '');
         $out['full_size'] = (int) ($d['full_size'] ?? 0);
         $out['php_ok'] = version_compare(PHP_VERSION, (string) ($d['php_min'] ?? '7.4.0'), '>=');
+
+        // ---- 跨版本升级链 ----
+        // 1.0.16 之前的更新服务不下发这些字段 → 下面的 $steps 会退化成「单步」，
+        // 行为与改造前逐字一致，不会因为更新服务还没换新版就报错。
+        $out['upgrade_mode'] = (string) ($d['upgrade_mode'] ?? '');
+        $out['chain_reason'] = (string) ($d['chain_reason'] ?? '');
+        $out['min_auto_version'] = (string) ($d['min_auto_version'] ?? '');
+        $chain = [];
+        foreach ((array) ($d['chain'] ?? []) as $s) {
+            if (!is_array($s)) {
+                continue;
+            }
+            $sv = (string) ($s['version'] ?? '');
+            $su = (string) ($s['url'] ?? '');
+            // 版本号与地址都要过白名单：这是「面板不得变成任意文件下载器」的下游防线 ——
+            // 即便更新服务被替换成恶意回应，也拿不到 file:// 之类的地址。
+            if ($sv === '' || preg_match('/^[0-9]+(\.[0-9]+){1,3}(-[A-Za-z0-9.]+)?$/', $sv) !== 1) {
+                continue;
+            }
+            if (!preg_match('#^https?://#i', $su)) {
+                continue;
+            }
+            $chain[] = [
+                'version' => $sv,
+                'from' => (string) ($s['from'] ?? ''),
+                'url' => $su,
+                'sha256' => strtolower((string) ($s['sha256'] ?? '')),
+                'size' => (int) ($s['size'] ?? 0),
+            ];
+        }
+
+        // 归一化「本次实际要应用的步骤」：优先用服务端下发的链；没有链（老服务端 / 单步发布）
+        // 时退化成一层只含目标版本的步骤。mode=full 时**必须**保持空 —— 那正是「这次走不了
+        // 自动升级」的信号，退化成单步会让下面的门禁全部放行，点下去照样失败在基线守卫上。
+        $steps = $chain;
+        if ($steps === [] && $out['upgrade_mode'] !== 'full'
+            && $out['update_type'] === 'incremental'
+            && $out['update_url'] !== '' && $out['update_sha256'] !== '') {
+            $steps = [[
+                'version' => $latest,
+                'from' => $out['update_from'],
+                'url' => $out['update_url'],
+                'sha256' => $out['update_sha256'],
+                'size' => $out['update_size'],
+            ]];
+        }
 
         if (!$out['has_update']) {
             $out['reason'] = '已是最新版本';
@@ -209,11 +282,27 @@ final class Updater
             $out['reason'] = 'PHP 未启用 zip 扩展，无法解压更新包（可手动下载覆盖）';
             return $out;
         }
+        // 服务端明确判定「这次只能走完整包」：链断了 / 跨目录布局 / 步数超过上限 / 本站版本太旧。
+        // 必须在这里拦住 —— 否则下面的门禁会全部放行，用户点下去仍旧失败在 applyPackage 的基线守卫上。
+        if ($out['upgrade_mode'] === 'full') {
+            $out['requires_full'] = true;
+            $out['reason'] = ($out['chain_reason'] !== '' ? $out['chain_reason'] . '。' : '')
+                . '请下载完整包按 docs/deploy.md「6.1 升级」手工迁移（保留 data/ 目录）';
+            return $out;
+        }
         // 包文件名是随机串（防猜测下载地址），不能再用「-update.zip」文件名启发式判断；
-        // 增量/完整以更新服务端 versions.json 的 update_type 为准，且必须有 sha256 供下载后校验。
-        if ($out['update_type'] !== 'incremental' || $out['update_url'] === '' || $out['update_sha256'] === '') {
+        // 增量/完整以更新服务端 versions.json 为准，且必须有 sha256 供下载后校验。
+        if ($steps === []) {
             $out['requires_full'] = true;
             $out['reason'] = '本次发布包含目录结构调整，请下载完整包按 docs/deploy.md「6.1 升级」手工迁移（保留 data/ 目录）';
+            return $out;
+        }
+        // 老更新服务只会给「紧邻上一版」的增量包，本站比它的基线还旧时它下不了手：
+        // 提前给出可读提示，别等 applyPackage 抛「低于基线」的异常（那句话说不到怎么解决）。
+        if ($out['chain_len'] === 0 && $out['update_from'] !== '' && version_compare($cur, $out['update_from'], '<')) {
+            $out['requires_full'] = true;
+            $out['reason'] = '本站版本 v' . $cur . ' 低于本次增量包的基线 v' . $out['update_from']
+                . '，且更新服务未提供跨版本升级路径；请下载完整包手工迁移（保留 data/ 目录）';
             return $out;
         }
         if ($layout !== 'unified') {
@@ -228,7 +317,15 @@ final class Updater
         }
 
         $out['can_auto'] = true;
-        $out['reason'] = '可以自动升级到 v' . $latest;
+        $out['chain'] = $steps;
+        $out['chain_len'] = count($steps);
+        if (count($steps) > 1) {
+            $path = array_merge([$cur], array_column($steps, 'version'));
+            $out['reason'] = '可以自动升级到 v' . $latest . '：将依次应用 ' . count($steps)
+                . ' 个增量包（' . implode(' → ', $path) . '）';
+        } else {
+            $out['reason'] = '可以自动升级到 v' . $latest;
+        }
         return $out;
     }
 
@@ -236,9 +333,15 @@ final class Updater
 
     /**
      * 下载并应用更新。$downloadUrl / $sha256 由 check() 提供。
+     *
+     * $opts['root'] 可指向另一棵目录树（自测沙箱 / 批量升级工具）：下载临时目录与
+     * applyPackage 的目标必须**是同一棵树** —— 以前这里写死 self::root()，于是
+     * 「换个 root 应用包」的能力只存在了一半，测起来会把真身开发副本升掉。
+     *
+     * @param array{root?:string,run_sql?:bool,dry_run?:bool} $opts
      * @return array{ok:bool,version:string,notice:string,files:int,deleted:int,sql:int,backup:string,msgs:array}
      */
-    public static function apply(string $downloadUrl, string $sha256 = ''): array
+    public static function apply(string $downloadUrl, string $sha256 = '', array $opts = []): array
     {
         if (!(bool) wstat_config('update.enabled')) {
             throw new \RuntimeException('本站已关闭一键升级（config.php: update.enabled=false）');
@@ -246,7 +349,8 @@ final class Updater
         if (!preg_match('#^https?://#i', $downloadUrl)) {
             throw new \RuntimeException('非法的下载地址：' . $downloadUrl);
         }
-        $tmpDir = self::root() . '/data/tmp';
+        $root = rtrim(str_replace('\\', '/', $opts['root'] ?? self::root()), '/');
+        $tmpDir = $root . '/data/tmp';
         if (!is_dir($tmpDir) && !@mkdir($tmpDir, 0755, true)) {
             throw new \RuntimeException('无法创建临时目录：' . $tmpDir);
         }
@@ -260,10 +364,156 @@ final class Updater
                     throw new \RuntimeException('下载的更新包校验失败（sha256 不一致），已中止以免写入损坏文件');
                 }
             }
-            return self::applyPackage($zipFile);
+            return self::applyPackage($zipFile, $opts);
         } finally {
             @unlink($zipFile);
         }
+    }
+
+    /**
+     * 按升级链依次应用多个增量包 —— 跨版本升级（例如 v1.0.10 一站升到 v1.0.16）。
+     *
+     * 为什么能这样叠：每个增量包清单里的每个文件带的是**完整内容 + 绝对 sha256**，
+     * 不是二进制补丁，所以 A→B→C 写出来的就是 C 的文件树，与一步 A→C 等价。
+     * 改动打包方式（比如哪天换成真正的 diff 包）时，这条前提必须重新论证。
+     *
+     * 三个刻意的设计：
+     *  ① **软时间预算**：超预算就返回 done=false（此时已经干净地升到某一版），
+     *     由调用方再发一次请求续跑。链是按「当前实际版本」重算的，天然可续、可重试。
+     *  ② **每步校验版本真的前进**：包写完了版本号却没变，说明包与本站不匹配，
+     *     再叠下一个包会把两棵不同的树混在一起 —— 必须立刻停。
+     *  ③ **失败不吞错**：异常消息里带上「第几步 / 已完成几步 / 当前版本」，
+     *     用户再点一次即可从当前版本继续，不需要手工救火。
+     *
+     * @param array $steps check() 返回的 chain[]（升序），每项含 version/url/sha256
+     * @param array{budget?:float|int,root?:string,run_sql?:bool,dry_run?:bool} $opts
+     *        budget=0 表示不限时间（一次请求跑完整条链，自测用）；
+     *        root 指向另一棵树时，下载临时目录与写入目标都在那棵树下（自测沙箱）
+     * @return array{ok:bool,done:bool,from:string,version:string,target:string,step_done:int,step_total:int,files:int,deleted:int,sql:int,notice:string,msgs:array,steps:array,backup:string}
+     */
+    public static function applyChain(array $steps, array $opts = []): array
+    {
+        if (!(bool) wstat_config('update.enabled')) {
+            throw new \RuntimeException('本站已关闭一键升级（config.php: update.enabled=false）');
+        }
+        $clean = [];
+        foreach ($steps as $s) {
+            if (!is_array($s)) {
+                continue;
+            }
+            $v = (string) ($s['version'] ?? '');
+            $u = (string) ($s['url'] ?? '');
+            if ($v === '' || !preg_match('#^https?://#i', $u)) {
+                continue;
+            }
+            $clean[] = [
+                'version' => $v,
+                'url' => $u,
+                'sha256' => strtolower((string) ($s['sha256'] ?? '')),
+            ];
+        }
+        if ($clean === []) {
+            throw new \RuntimeException('升级链为空或格式不正确，无法自动升级');
+        }
+
+        // 尽量放宽 PHP 执行时间。host 侧若另有硬限制（FPM request_terminate_timeout 等），
+        // 下面的软预算会先一步干净返回，不依赖这行生效。
+        @set_time_limit(300);
+
+        // 预算允许小数：默认 20 秒，自测用它精确触发「跑到一半返回 done=false」的续跑分支
+        $budget = (float) ($opts['budget'] ?? self::CHAIN_BUDGET);
+        unset($opts['budget']);        // 其余选项（root / run_sql / dry_run）原样透传给单步应用
+
+        // ⚠️ 版本必须读**将被修改的那棵树**：不传 root 时读运行实例，传了就读那棵树。
+        //    这里若用 self::localVersion()（恒读运行实例），换 root 的场景下「每步版本必须
+        //    前进」的校验会在第一棵树就误判 —— 自测沙箱与批量升级工具都会中招。
+        $rootOpt = isset($opts['root']) && (string) $opts['root'] !== '' ? (string) $opts['root'] : null;
+
+        $start = self::localVersion($rootOpt);
+        $total = count($clean);
+        $last = $clean[$total - 1]['version'];
+        $t0 = microtime(true);
+        $done = [];
+        $files = 0;
+        $deleted = 0;
+        $sql = 0;
+        $msgs = [];
+        $backup = '';
+
+        foreach ($clean as $i => $s) {
+            $ver = $s['version'];
+            try {
+                $r = self::apply($s['url'], $s['sha256'], $opts);
+            } catch (\Throwable $e) {
+                throw new \RuntimeException(
+                    '第 ' . ($i + 1) . '/' . $total . ' 步（升级到 v' . $ver . '）失败：' . $e->getMessage()
+                    . '；' . (count($done) > 0
+                        ? '已完成 ' . count($done) . ' 步，当前版本 v' . self::localVersion($rootOpt)
+                        : '尚未写入任何文件')
+                    . '。再次点击升级会从当前版本重新计算剩余步骤。'
+                );
+            }
+            $files   += (int) ($r['files'] ?? 0);
+            $deleted += (int) ($r['deleted'] ?? 0);
+            $sql     += (int) ($r['sql'] ?? 0);
+            $backup   = (string) ($r['backup'] ?? '');
+            foreach ((array) ($r['msgs'] ?? []) as $m) {
+                $msgs[] = 'v' . $ver . '：' . (string) $m;
+            }
+            $done[] = [
+                'version' => $ver,
+                'files' => (int) ($r['files'] ?? 0),
+                'deleted' => (int) ($r['deleted'] ?? 0),
+                'sql' => (int) ($r['sql'] ?? 0),
+            ];
+
+            $now = self::localVersion($rootOpt);
+            if (version_compare($now, $ver, '<')) {
+                throw new \RuntimeException('第 ' . ($i + 1) . ' 步的文件已写入，但本站版本仍为 v' . $now
+                    . '（期望 v' . $ver . '）：更新包与本站不匹配，已停止后续步骤。请改用完整包手工覆盖。');
+            }
+
+            if ($budget > 0 && $i < $total - 1 && (microtime(true) - $t0) >= $budget) {
+                return [
+                    'ok' => true,
+                    'done' => false,
+                    'from' => $start,
+                    'version' => $now,
+                    'target' => $last,
+                    'step_done' => count($done),
+                    'step_total' => $total,
+                    'files' => $files,
+                    'deleted' => $deleted,
+                    'sql' => $sql,
+                    'backup' => $backup,
+                    'msgs' => $msgs,
+                    'steps' => $done,
+                    'notice' => '已升级到 v' . $now . '（' . count($done) . '/' . $total
+                        . ' 步），单次请求时间预算用尽，正在继续剩余步骤…',
+                ];
+            }
+        }
+
+        $path = array_merge([$start], array_column($done, 'version'));
+        return [
+            'ok' => true,
+            'done' => true,
+            'from' => $start,
+            'version' => self::localVersion($rootOpt),
+            'target' => $last,
+            'step_done' => count($done),
+            'step_total' => $total,
+            'files' => $files,
+            'deleted' => $deleted,
+            'sql' => $sql,
+            'backup' => $backup,
+            'msgs' => $msgs,
+            'steps' => $done,
+            'notice' => ($total > 1
+                    ? '已跨 ' . $total . ' 个增量包升级到 v' . $last . '（' . implode(' → ', $path) . '）'
+                    : '已升级到 v' . $last)
+                . '：写入 ' . $files . ' 个文件，删除 ' . $deleted . ' 个，执行增量 SQL ' . $sql . ' 个',
+        ];
     }
 
     /**
@@ -284,6 +534,13 @@ final class Updater
         $runSql  = (bool) ($opts['run_sql'] ?? true);
         $dryRun  = (bool) ($opts['dry_run'] ?? false);
 
+        $msgs = [];
+        // 上一次升级若在「文件已写完、SQL 还没跑」之间被硬杀（PHP 超时 / FPM 重启），
+        // 版本号已经前进，链会从新版本重算 —— 那一步的 SQL 就再没人补。这里先补上。
+        if ($runSql !== false && !$dryRun) {
+            self::flushPendingSql($root, $msgs);
+        }
+
         $zip = new ZipArchive();
         if ($zip->open($zipFile) !== true) {
             throw new \RuntimeException('无法打开更新包（文件损坏或不是 zip）');
@@ -300,7 +557,8 @@ final class Updater
             throw new \RuntimeException('更新包清单格式不正确');
         }
 
-        $msgs = [];
+        // ⚠️ 这里**不要**再写 $msgs = [] —— 它会把上面 flushPendingSql() 补执行的记录清掉，
+        //    症状是「补执行确实跑了，但用户永远看不到这条提示」（自测 ⑧-3 钉的就是这一条）。
         $version = (string) ($mf['version'] ?? '');
         $from    = (string) ($mf['from'] ?? '');
         $titles  = 'v' . ($version !== '' ? $version : '?') . ($from !== '' ? "（基线 v{$from}）" : '');
@@ -518,6 +776,11 @@ final class Updater
         if ($sqlList && $runSql === false) {
             $msgs[] = '已按 run_sql=false 跳过增量 SQL：' . implode('、', $sqlList);
         }
+        // 记账「这些脚本还没跑完」：万一下面被硬杀（超时/进程重启），下次升级进来能补上。
+        // 必须先写后跑 —— 反过来又会出现原来那个「文件写了、SQL 漏了」的空窗。
+        if ($sqlList && $runSql !== false) {
+            self::writePendingSql($root, $sqlList, $version, $from);
+        }
         if ($runSql !== false) {
             foreach ($sqlList as $rel) {
                 if (!is_file($root . '/' . $rel)) {
@@ -531,6 +794,11 @@ final class Updater
                     break;
                 }
             }
+        }
+        // 走到这里说明「跑的这一次」有了结论（成功或已如实报错），补执行记录可以撤了。
+        // 刻意不在失败时保留：失败原因已明确告知用户，留着只会让下次升级再报一次同样的错。
+        if ($sqlList && $runSql !== false) {
+            self::clearPendingSql($root);
         }
 
         // ---- 记账：写升级流水与回滚清单 ----
@@ -685,6 +953,74 @@ final class Updater
             'updated_at' => date('c'),
             'history'    => $hist,
         ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT) . "\n");
+    }
+
+    /* ----- 增量 SQL 的漏跑补偿（跨版本分步升级放大了这个空窗） ----- */
+
+    /**
+     * 记下「这些增量脚本正要执行」。
+     *
+     * 存在的理由：升级的步骤是「先写文件（含 app/version.php）、后跑 SQL」，进程若在两者
+     * 之间被硬杀，下一次 check() 看到的就是新版本号 → 链从新版本重算 → 那一步的 SQL
+     * 永远没人补，站点表面升级成功、实际缺表缺列。分步升级让这个空窗出现了 N 次。
+     */
+    private static function writePendingSql(string $root, array $sqlList, string $version, string $from): void
+    {
+        $dir = $root . '/data';
+        if (!is_dir($dir) && !@mkdir($dir, 0755, true)) {
+            return;   // 补执行记录是尽力而为，写不了也不该中断升级本身
+        }
+        @file_put_contents($dir . '/pending-sql.json', json_encode([
+            'version' => $version,
+            'from'    => $from,
+            'sql'     => array_values($sqlList),
+            'at'      => date('c'),
+            'hint'    => '本文件表示这些增量 SQL 尚未确认执行完；下一次升级会自动补执行并删除本文件',
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT) . "\n");
+    }
+
+    private static function clearPendingSql(string $root): void
+    {
+        @unlink($root . '/data/pending-sql.json');
+    }
+
+    /**
+     * 补执行上次被中断而漏掉的增量 SQL。
+     *
+     * 尽力而为：脚本文件已被后续版本覆盖/删除时跳过；执行失败如实写进 $msgs（不抛异常，
+     * 因为这是「上一次」的收尾，不该阻断「这一次」的升级）。
+     * 调用方是 applyPackage()，在写入任何文件之前 —— 补的是上一版留下的账。
+     */
+    private static function flushPendingSql(string $root, array &$msgs): void
+    {
+        $file = $root . '/data/pending-sql.json';
+        if (!is_file($file)) {
+            return;
+        }
+        $j = json_decode((string) @file_get_contents($file), true);
+        $list = [];
+        foreach ((array) (is_array($j) ? ($j['sql'] ?? []) : []) as $rel) {
+            $rel = self::safeRel((string) $rel);
+            if ($rel !== null && is_file($root . '/' . $rel)) {
+                $list[] = $rel;
+            }
+        }
+        if ($list === []) {
+            self::clearPendingSql($root);
+            return;
+        }
+        $ver = (string) (is_array($j) ? ($j['version'] ?? '') : '');
+        foreach ($list as $rel) {
+            try {
+                $n = self::runSqlFile($root . '/' . $rel);
+                $msgs[] = '补执行上次未完成的增量 SQL'
+                    . ($ver !== '' ? '（v' . $ver . '）' : '') . '：' . $rel . '（' . $n . ' 条）';
+            } catch (\Throwable $e) {
+                $msgs[] = '补执行增量 SQL ' . $rel . ' 失败（请手工执行）：' . $e->getMessage();
+                break;
+            }
+        }
+        self::clearPendingSql($root);
     }
 
     /** 写回滚清单：记录备份了哪些文件、删了哪些、执行了哪些 SQL */

@@ -31,12 +31,3 @@
 > 目录结构特殊（面板 open_basedir 受限）时：安装向导会显示「目录结构诊断」页，
 > 可直接填入项目根生成 `public/install/local.php`，或执行 `php public/install/cli.php --check`。
 
-## 版本号怎么改（自己二次开发时）
-
-版本号只有一处需要手改：`install/lib.php` 的 `Installer::VERSION`；改完执行
-`php scripts/write-version.php` 把 `app/version.php`（一个明文版本号）同步成同一个值。
-发版脚本会校验两者一致，不一致直接中止构建。
-**不要**去改 `data/installed.php` 的 version —— 那只是安装快照，不参与版本判定；
-也不要指望在 `config.php` 里写版本号 —— 版本号只在 `app/version.php` 这一处。
-
-详见 `docs/deploy.md`。

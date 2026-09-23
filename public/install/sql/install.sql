@@ -25,10 +25,13 @@
 --   site_daily   站点每日汇总（cron rollup 生成）
 --   funnels      转化漏斗定义
 --   goals        转化目标（页面目标 / 自定义事件目标）
+--   segments     命名分段（保存一组全局过滤条件，供各分析页复用）
 --   api_tokens   开放 API 个人访问令牌（PAT，只读白名单接口）
 --   site_members 站点协作成员（多用户只读/可编辑）
 --   notify_channels / alert_rules / alert_logs / report_subscriptions / sys_settings
 --                告警与日报（推送渠道 / 规则 / 记录 / 订阅）
+--   spider_hits  蜘蛛抓取聚合（与访客口径隔离）
+--   share_links  公开只读分享链接（免登录查看指定站点的汇总报表）
 -- =====================================================================
 
 -- ---------------------------------------------------------------------
@@ -225,6 +228,25 @@ CREATE TABLE IF NOT EXISTS `goals` (
   `match_type` VARCHAR(10)   NOT NULL DEFAULT 'contains',
   `is_active`  TINYINT       NOT NULL DEFAULT 1,
   `created_at` INT UNSIGNED  NOT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_site` (`site_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------
+-- 命名分段（Segments）：把一组「全局过滤条件」存成可复用的切片
+--   params: 条件数组的 JSON，与 URL 上的 ?f= 参数**完全同构**（可直接互换）
+--     例 [{"f":"device","o":"in","v":["mobile"]},{"f":"country","o":"eq","v":"中国"}]
+--   只存条件、不存数据快照：换个时间区间即可复算，因此分段永不过期。
+--   维度与操作符白名单见 Support\Filter::COLS / OPS（非法项在写入与读取时都会被丢弃）。
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `segments` (
+  `id`         INT UNSIGNED  NOT NULL AUTO_INCREMENT,
+  `site_id`    INT UNSIGNED  NOT NULL,
+  `name`       VARCHAR(100)  NOT NULL,
+  `params`     TEXT          NOT NULL,
+  `created_by` INT UNSIGNED  NOT NULL DEFAULT 0,
+  `created_at` INT UNSIGNED  NOT NULL,
+  `updated_at` INT UNSIGNED  NOT NULL DEFAULT 0,
   PRIMARY KEY (`id`),
   KEY `idx_site` (`site_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

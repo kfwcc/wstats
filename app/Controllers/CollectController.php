@@ -38,27 +38,52 @@ class CollectController
     private const SPIDER_RATE_PER_MIN = 300;        // 同站点同 IP 每分钟**蜘蛛记账**上限（独立桶，见 handle()）
     private const MAX_PAYLOAD = 8192;               // 事件附加数据 JSON 上限（字节）
 
+    /**
+     * 1×1 透明 GIF（42 字节，base64）。
+     * 图片信标模式（/pixel.php，用于邮件打开率 / 无 JS 环境）下，**无论成功或失败**都回它：
+     *  - 图片永远能正常渲染，不破图；
+     *  - 不向被统计页面的访问者泄露「站点是否启用/是否验证」这类采集状态。
+     */
+    public const PIXEL_GIF_B64 = 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+
+    /** 响应形态：json（/collect.php、/api/collect）/ gif（/pixel.php 图片信标） */
+    private string $out;
+
+    public function __construct(string $out = 'json')
+    {
+        $this->out = $out === 'gif' ? 'gif' : 'json';
+    }
+
     /** 入口 */
     public function handle(Request $req): void
     {
+        // ⚠️ 每个 fail() 之后必须显式 return：
+        // JSON 模式下 fail() 走 wstat_err → wstat_json → exit(0)，自然终止；
+        // 但**图片信标模式**下 fail() 只输出 GIF 就返回（不能让图片破图），
+        // 少了 return 会继续往下跑：坏 ak 会走到 $site['status'] 抛错，
+        // 报错文本被追加进图片体 → 破图，且可能继续写脏数据。
         // ---- 全局采集开关（系统设置 → 功能开关）----
         if (!Settings::int('collect_enabled')) {
-            wstat_err('collect disabled', 403);
+            $this->fail('collect disabled', 403);
+            return;
         }
 
         // ---- 站点校验 ----
         $siteKey = trim((string) $req->input('ak', ''));
         $site = SiteStore::byKey($siteKey);
         if ($site === null) {
-            wstat_err('bad site', 404);
+            $this->fail('bad site', 404);
+            return;
         }
         if ((int) $site['status'] !== 1) {
-            wstat_err('site disabled', 403);
+            $this->fail('site disabled', 403);
+            return;
         }
         // 仅已验证站点才允许采集上报（SDK 生效前提）。本地联调可设 WSTAT_ALLOW_UNVERIFIED=1 放开。
         $allowUnverified = (bool) (getenv('WSTAT_ALLOW_UNVERIFIED') ?: '0');
         if (!$allowUnverified && (int) $site['verified_at'] === 0) {
-            wstat_err('site unverified', 403);
+            $this->fail('site unverified', 403);
+            return;
         }
 
         $sid = (int) $site['id'];
@@ -356,10 +381,42 @@ class CollectController
         }
     }
 
-    /** 极简成功体 */
+    /** 极简成功体（按响应形态分支：JSON 或 1×1 GIF） */
     private function tiny(): void
     {
+        if ($this->out === 'gif') {
+            $this->pix();
+            return;
+        }
         wstat_json(['ok' => 1], 200);
+    }
+
+    /**
+     * 失败响应：JSON 模式沿用 wstat_err（带 HTTP 状态码便于 SDK 排查）；
+     * 图片信标模式静默回 1×1 GIF + 200 —— 图片信标不应对访问者产生任何可感知差异，
+     * 也不该让邮件客户端的隐私代理从状态码推断站点状态（与爬虫静默丢弃同一设计取向）。
+     */
+    private function fail(string $msg, int $http): void
+    {
+        if ($this->out === 'gif') {
+            $this->pix();
+            return;
+        }
+        wstat_err($msg, $http);
+    }
+
+    /** 输出 1×1 透明 GIF（图片信标专用，永不缓存） */
+    private function pix(): void
+    {
+        if (!headers_sent()) {
+            http_response_code(200);
+            header('Content-Type: image/gif');
+            // 信标必须每次真实回源：缓存住就等于丢失后续打开/点击的计数
+            header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+            header('Pragma: no-cache');
+            header('X-Content-Type-Options: nosniff');
+        }
+        echo base64_decode(self::PIXEL_GIF_B64);
     }
 
     private static function id($v, int $maxLen): string

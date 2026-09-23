@@ -18,6 +18,7 @@ use Wstat\Controllers\OpenController;
 use Wstat\Controllers\ProfileController;
 use Wstat\Controllers\SiteController;
 use Wstat\Controllers\SettingController;
+use Wstat\Controllers\ShareController;
 use Wstat\Controllers\SpiderController;
 use Wstat\Controllers\StatsController;
 use Wstat\Controllers\TokenController;
@@ -105,6 +106,11 @@ $router->group('/api', function (Router $r) {
     // 官方接入仍用 /collect.php；此通道供「.php 路径被 CDN / WAF 拦截」或伪静态不便修改的环境使用，
     // 因为它同样经过 nginx 的 location ^~ /api/ → index.php，无需单独放行 .php。
     $r->post('/collect', [new CollectController(), 'handle']);
+    // ---- 图片信标：备用通道（参数与 /pixel.php 完全一致，响应恒为 1×1 GIF）----
+    // 适用于「.php 路径被 CDN / WAF 拦截」或伪静态不便修改的环境。
+    $r->get('/pixel', function () {
+        (new CollectController('gif'))->handle(new Request());
+    });
 
     // ---- 认证 ----
     $auth = new AuthController();
@@ -202,12 +208,26 @@ $router->group('/api', function (Router $r) {
     $r->patch('/stats/goals/{id}', [$st, 'goalUpdate']);
     $r->delete('/stats/goals/{id}', [$st, 'goalDelete']);
     $r->get('/stats/goals/{id}/data', [$st, 'goalData']);
+    // 全局过滤器 · 命名分段：存一组过滤条件供各分析页复用（条件与 URL 上的 ?f= 同构）
+    $r->get('/stats/segments', [$st, 'segments']);
+    $r->post('/stats/segments', [$st, 'segmentSave']);
+    $r->patch('/stats/segments/{id}', [$st, 'segmentUpdate']);
+    $r->delete('/stats/segments/{id}', [$st, 'segmentDelete']);
     $r->get('/screen/token', [$st, 'screenToken']);
     $r->get('/screen/data', [$st, 'screenData']);
 
     // ---- 数据导出（CSV；只读权限即可） ----
     $ex = new ExportController();
     $r->get('/export/{kind}', [$ex, 'handle']);
+
+    // ---- 公开只读分享链接 ----
+    // 管理侧（需登录，按站点角色校验）；/share/{token} 为公开端点，控制器内部按 token + 可选密码校验，
+    // 不依赖登录态 —— 这正是「把报表发给没有账号的人」的用法。
+    $sh = new ShareController();
+    $r->get('/shares', [$sh, 'index']);
+    $r->post('/shares', [$sh, 'store']);
+    $r->delete('/shares/{id}', [$sh, 'destroy']);
+    $r->get('/share/{token}', [$sh, 'publicData']);
 
     // ---- 流量异常告警 / 日报推送 ----
     // 渠道 / 规则 / 订阅均为「按用户」的个人配置；规则绑定站点时要求至少可编辑（编辑器/所有者）。
@@ -241,6 +261,13 @@ $router->group('/open/v1', function (Router $r) use ($open) {
     $r->get('/overview', [$open, 'overview']);
     $r->get('/pages', [$open, 'pages']);
     $r->get('/online', [$open, 'online']);
+    // v1.0.15 扩展：实时 / 来源 / 地域 / 搜索引擎 / 事件 / 会话明细
+    $r->get('/realtime', [$open, 'realtime']);
+    $r->get('/sources', [$open, 'sources']);
+    $r->get('/geo', [$open, 'geo']);
+    $r->get('/engines', [$open, 'engines']);
+    $r->get('/events', [$open, 'events']);
+    $r->get('/sessions', [$open, 'sessions']);
 });
 
 $req = new Request();

@@ -26,7 +26,7 @@ final class Installer
      *   · data/installed.php 的 version 是「安装当刻的快照」，合并配置时被显式忽略 ——
      *     它在手工覆盖代码 / 目录迁移下永不刷新，曾经导致页脚永远 v1.0.0、更新检查永远提示有更新。
      */
-    public const VERSION    = '1.0.14';
+    public const VERSION    = '1.0.17';
     public const MIN_PHP    = '7.4.0';
     public const SESSION_KEY = 'wstat_install';
 
